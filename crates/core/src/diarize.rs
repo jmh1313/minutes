@@ -366,6 +366,7 @@ pub struct StemPaths {
 enum SourceAwareDiarizationPlan {
     FullStems(StemPaths),
     SystemStemOnly(std::path::PathBuf),
+    SilentSystemStem(StemPaths),
 }
 
 fn stem_has_audio(path: &Path) -> bool {
@@ -388,6 +389,43 @@ fn stem_has_audio(path: &Path) -> bool {
             let bits = spec.bits_per_sample.clamp(1, 32);
             let max_value = (1_i64 << (bits - 1)) as f32;
             probe_stem_samples(
+                reader.into_samples::<i32>(),
+                spec.sample_rate,
+                spec.channels,
+                move |sample| sample as f32 / max_value,
+            )
+        }
+    }
+}
+
+fn stem_probe_observed_signal(path: &Path) -> ObservedSignal {
+    let Ok(reader) = hound::WavReader::open(path) else {
+        return ObservedSignal {
+            frames_captured: 0,
+            max_rms: 0.0,
+            avg_rms: 0.0,
+        };
+    };
+    let spec = reader.spec();
+    if spec.sample_rate == 0 || spec.channels == 0 {
+        return ObservedSignal {
+            frames_captured: 0,
+            max_rms: 0.0,
+            avg_rms: 0.0,
+        };
+    }
+
+    match spec.sample_format {
+        hound::SampleFormat::Float => probe_stem_observed_signal(
+            reader.into_samples::<f32>(),
+            spec.sample_rate,
+            spec.channels,
+            |sample| sample,
+        ),
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample.clamp(1, 32);
+            let max_value = (1_i64 << (bits - 1)) as f32;
+            probe_stem_observed_signal(
                 reader.into_samples::<i32>(),
                 spec.sample_rate,
                 spec.channels,
@@ -458,6 +496,66 @@ fn probe_stem_samples<T>(
     false
 }
 
+fn probe_stem_observed_signal<T>(
+    mut samples: impl Iterator<Item = Result<T, hound::Error>>,
+    sample_rate: u32,
+    channels: u16,
+    normalize: impl Fn(T) -> f32,
+) -> ObservedSignal {
+    let channels = channels as usize;
+    let max_frames = sample_rate as usize * STEM_PROBE_SECS;
+    let max_samples = max_frames * channels;
+    if max_frames == 0 || channels == 0 {
+        return ObservedSignal {
+            frames_captured: 0,
+            max_rms: 0.0,
+            avg_rms: 0.0,
+        };
+    }
+
+    let mut samples_read = 0usize;
+    let mut frames_read = 0usize;
+    let mut channel_index = 0usize;
+    let mut frame_sum = 0.0_f32;
+    let mut sum_sq = 0.0_f64;
+    let mut max_abs = 0.0_f32;
+
+    while samples_read < max_samples && frames_read < max_frames {
+        let Some(sample) = samples.next() else {
+            break;
+        };
+        samples_read += 1;
+        let Ok(sample) = sample else {
+            continue;
+        };
+
+        frame_sum += normalize(sample);
+        channel_index += 1;
+        if channel_index < channels {
+            continue;
+        }
+
+        let mono = frame_sum / channels as f32;
+        max_abs = max_abs.max(mono.abs());
+        sum_sq += (mono as f64) * (mono as f64);
+        frames_read += 1;
+        channel_index = 0;
+        frame_sum = 0.0;
+    }
+
+    let avg_rms = if frames_read == 0 {
+        0.0
+    } else {
+        (sum_sq / frames_read as f64).sqrt() as f32
+    };
+
+    ObservedSignal {
+        frames_captured: frames_read,
+        max_rms: max_abs,
+        avg_rms,
+    }
+}
+
 fn discover_stem_plan(audio_path: &Path) -> Option<SourceAwareDiarizationPlan> {
     let stem = audio_path.file_stem()?.to_str()?;
     let dir = audio_path.parent()?;
@@ -488,12 +586,24 @@ fn discover_stem_plan(audio_path: &Path) -> Option<SourceAwareDiarizationPlan> {
             Some(SourceAwareDiarizationPlan::SystemStemOnly(system))
         }
         (true, false) => {
-            tracing::warn!(
-                voice = %voice.display(),
-                system = %system.display(),
-                "system stem missing or empty; skipping source-aware diarization"
-            );
-            None
+            if system.exists() {
+                tracing::warn!(
+                    voice = %voice.display(),
+                    system = %system.display(),
+                    "system stem exists but has no detected audio"
+                );
+                Some(SourceAwareDiarizationPlan::SilentSystemStem(StemPaths {
+                    voice,
+                    system,
+                }))
+            } else {
+                tracing::warn!(
+                    voice = %voice.display(),
+                    system = %system.display(),
+                    "system stem missing; skipping source-aware diarization"
+                );
+                None
+            }
         }
         (false, false) => None,
     }
@@ -1379,6 +1489,38 @@ fn dominant_ratio_degraded(result: &DiarizationResult) -> bool {
         && result.voice_dominant_ratio > result.system_dominant_ratio
 }
 
+fn silent_system_stem_degraded_capture(system_stem: &Path) -> DegradedCapture {
+    DegradedCapture {
+        failure_kind: FailureKind::Silent,
+        capture_backend: "cpal".into(),
+        capture_source: CaptureSource::System,
+        voice_active_ratio: Some(1.0),
+        system_active_ratio: Some(0.0),
+        observed_signal: stem_probe_observed_signal(system_stem),
+        diagnostic_confidence: DiagnosticConfidence::Inferred,
+    }
+}
+
+fn degraded_capture_for_silent_system_stem(
+    audio_path: &Path,
+    system_stem: &Path,
+    ctx: DiarizationContext<'_>,
+) -> Option<DegradedCapture> {
+    if ctx.purpose != DiarizationPurpose::PrimaryMeeting {
+        return None;
+    }
+
+    // If the duration probe fails, behave conservatively in the guard path:
+    // primary source-aware diarization that cannot prove it is short is treated
+    // as long enough for the degraded-capture guard.
+    let duration_secs = audio_duration_secs(audio_path).unwrap_or(f64::INFINITY);
+    if duration_secs <= PRIMARY_DEGRADED_MIN_DURATION_SECS {
+        return None;
+    }
+
+    Some(silent_system_stem_degraded_capture(system_stem))
+}
+
 fn degraded_capture_for_primary_result(
     audio_path: &Path,
     result: &DiarizationResult,
@@ -1482,6 +1624,24 @@ pub fn diarize_with_context(
                         None => DiarizationOutcome::NotConfigured,
                     };
                 }
+            }
+            SourceAwareDiarizationPlan::SilentSystemStem(stems) => {
+                if let Some(reason) =
+                    degraded_capture_for_silent_system_stem(audio_path, &stems.system, ctx)
+                {
+                    tracing::warn!(
+                        failure_kind = ?reason.failure_kind,
+                        voice = %stems.voice.display(),
+                        system = %stems.system.display(),
+                        "system stem is silent; leaving primary transcript unlabeled"
+                    );
+                    return DiarizationOutcome::Skipped { reason };
+                }
+                tracing::warn!(
+                    voice = %stems.voice.display(),
+                    system = %stems.system.display(),
+                    "system stem is silent outside primary guard; skipping source-aware diarization"
+                );
             }
         }
     }
@@ -3365,7 +3525,28 @@ mod tests {
     }
 
     #[test]
-    fn primary_degraded_stem_result_skips_without_unknown_spam_and_sets_health() {
+    fn discover_stem_plan_detects_existing_silent_system_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("call.wav");
+        let voice = dir.path().join("call.voice.wav");
+        let system = dir.path().join("call.system.wav");
+        std::fs::write(&audio, b"wav").unwrap();
+        write_active_wav(&voice);
+        write_i16_wav(&system, 1_000, 1, 1_000, |_, _| 0);
+
+        let plan = discover_stem_plan(&audio);
+
+        assert_eq!(
+            plan,
+            Some(SourceAwareDiarizationPlan::SilentSystemStem(StemPaths {
+                voice,
+                system,
+            }))
+        );
+    }
+
+    #[test]
+    fn primary_sparse_stem_result_skips_without_unknown_spam_and_sets_health() {
         let dir = tempfile::tempdir().unwrap();
         let audio = dir.path().join("call.wav");
         let voice = dir.path().join("call.voice.wav");
@@ -3406,9 +3587,64 @@ mod tests {
         let DiarizationOutcome::Skipped { reason } = outcome else {
             panic!("expected degraded primary capture to skip");
         };
+        assert_eq!(reason.failure_kind, FailureKind::Sparse);
         assert_eq!(reason.capture_source, CaptureSource::System);
         let health: crate::markdown::RecordingHealth = reason.into();
         assert_eq!(health.capture_warnings.len(), 1);
+        assert_eq!(health.capture_warnings[0].kind, FailureKind::Sparse);
+        assert_eq!(health.capture_warnings[0].source, CaptureSource::System);
+        assert_eq!(
+            health.diarization_path,
+            Some(crate::markdown::DiarizationPath::None)
+        );
+        assert!(!transcript.contains("[UNKNOWN"));
+        assert!(!transcript.contains("[SPEAKER_0"));
+    }
+
+    #[test]
+    fn primary_zero_system_stem_skips_without_unknown_spam_and_sets_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("call.wav");
+        let voice = dir.path().join("call.voice.wav");
+        let system = dir.path().join("call.system.wav");
+        let sample_rate = 1_000;
+        let frames = 61_000;
+        write_i16_wav(&audio, sample_rate, 1, frames, |_, _| 0);
+        write_i16_wav(&voice, sample_rate, 1, frames, |_, _| 3_000);
+        write_i16_wav(&system, sample_rate, 1, frames, |_, _| 0);
+
+        let config = Config::default();
+        let transcript = "[0:00] First line\n[0:10] Second line\n";
+        let windows = vec![
+            TranscriptWindow {
+                start_secs: 0.0,
+                end_secs: 8.0,
+            },
+            TranscriptWindow {
+                start_secs: 10.0,
+                end_secs: 18.0,
+            },
+        ];
+        let outcome = diarize_with_context(
+            &audio,
+            &config,
+            DiarizationContext {
+                purpose: DiarizationPurpose::PrimaryMeeting,
+                transcript_windows: Some(&windows),
+            },
+        );
+
+        let DiarizationOutcome::Skipped { reason } = outcome else {
+            panic!("expected zero-system primary capture to skip");
+        };
+        assert_eq!(reason.failure_kind, FailureKind::Silent);
+        assert_eq!(reason.capture_source, CaptureSource::System);
+        assert_eq!(reason.system_active_ratio, Some(0.0));
+        assert_eq!(reason.observed_signal.max_rms, 0.0);
+        let health: crate::markdown::RecordingHealth = reason.into();
+        assert_eq!(health.capture_warnings.len(), 1);
+        assert_eq!(health.capture_warnings[0].kind, FailureKind::Silent);
+        assert_eq!(health.capture_warnings[0].source, CaptureSource::System);
         assert_eq!(
             health.diarization_path,
             Some(crate::markdown::DiarizationPath::None)
