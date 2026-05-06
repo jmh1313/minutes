@@ -253,6 +253,22 @@
       overflow: hidden;
       background: var(--bg);
       border-right: none;
+      position: relative;
+    }
+
+    .window-drag-strip {
+      display: none;
+    }
+
+    html[data-platform="macos"] .window-drag-strip {
+      display: block;
+      position: absolute;
+      top: 0;
+      left: 72px;
+      right: 0;
+      height: 28px;
+      z-index: 5;
+      -webkit-app-region: drag;
     }
 
     /* ── Drag handle between panes ── */
@@ -4294,14 +4310,15 @@
 <body>
   <div class="app-left">
     <!-- Header -->
-    <div class="header">
-      <div class="brand">
-        <span class="brand-mark" role="img" aria-label="Minutes">
-          <img class="brand-mark-light" src="assets/app-mark-light.png" alt="" aria-hidden="true">
-          <img class="brand-mark-dark" src="assets/app-icon.png" alt="" aria-hidden="true">
+    <div class="window-drag-strip" data-tauri-drag-region aria-hidden="true"></div>
+    <div class="header" data-tauri-drag-region>
+      <div class="brand" data-tauri-drag-region>
+        <span class="brand-mark" role="img" aria-label="Minutes" data-tauri-drag-region>
+          <img class="brand-mark-light" src="assets/app-mark-light.png" alt="" aria-hidden="true" data-tauri-drag-region>
+          <img class="brand-mark-dark" src="assets/app-icon.png" alt="" aria-hidden="true" data-tauri-drag-region>
         </span>
-        <div class="brand-copy">
-          <div class="brand-sub">Conversation memory for humans and agents</div>
+        <div class="brand-copy" data-tauri-drag-region>
+          <div class="brand-sub" data-tauri-drag-region>Conversation memory for humans and agents</div>
         </div>
       </div>
       <div class="header-actions">
@@ -4579,11 +4596,11 @@
 
   <!-- ── Recall panel (right side, embedded terminal) ── -->
   <div class="recall-panel" id="recall-panel">
-    <div class="recall-header">
-      <div class="recall-header-info">
-        <div class="recall-phase-dot" id="recall-dot" aria-label="Phase: Recall"></div>
-        <span class="recall-phase-label" id="recall-phase-label">Recall</span>
-        <span class="recall-context-label" id="recall-context-label"></span>
+    <div class="recall-header" data-tauri-drag-region>
+      <div class="recall-header-info" data-tauri-drag-region>
+        <div class="recall-phase-dot" id="recall-dot" aria-label="Phase: Recall" data-tauri-drag-region></div>
+        <span class="recall-phase-label" id="recall-phase-label" data-tauri-drag-region>Recall</span>
+        <span class="recall-context-label" id="recall-context-label" data-tauri-drag-region></span>
       </div>
       <div class="recall-header-actions">
         <button class="btn btn-secondary btn-sm" id="btn-recall-weekly">Weekly</button>
