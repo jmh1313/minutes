@@ -2,7 +2,7 @@
 
 > Generated file. Do not edit by hand.
 > Source: manifest.json + crates/mcp/src/index.ts + site/lib/skills-catalog.json
-> Last generated: 2026-05-04
+> Last generated: 2026-05-07
 
 ## Product
 
@@ -10,12 +10,12 @@ Minutes is an open-source meeting corpus you own. Record, transcribe, search, an
 
 29 tools • 7 resources • Interactive MCP App dashboard • Prompt templates
 
-**What's new in 0.16.1:**
-• **Local vocabulary.** Add proper nouns, names, and acronyms to `~/.minutes/vocabulary.toml`. Minutes passes them as weighted hints before transcription — names you care about are spelled right the first time. Manage with `minutes vocabulary add/list/suggest`.
-• **Dictation engine upgrades.** Parakeet and Apple Speech are now available as dictation backends alongside Whisper. Linux clipboard insertion via xdotool/xclip. Local recents memory for faster repeat phrases. Six macOS focus-reliability fixes so the target app regains focus cleanly after every dictation.
-• **macOS permission center.** The desktop app surfaces microphone, screen-recording, and accessibility entitlements in a dedicated settings panel, monitors for live permission changes, and opens the relevant System Settings pane on click.
-• **macOS main-window chrome.** Compact header, brand mark aligned with sidebar, window restored on dock-click, clean app quit through the Tauri runtime (no more macOS crash reports).
-• **Windows Recall fix.** The agent finder no longer picks the bare Unix shebang `claude` file over `claude.cmd` on Windows, fixing the os error 193 CreateProcessW crash in Recall (issue #205).
+**What's new in 0.16.2:**
+• **Safer call-capture diarization.** Silent or degraded system stems no longer produce noisy `[UNKNOWN]` speaker spam. Minutes preserves the transcript and records structured capture-health metadata when diarization should be skipped.
+• **Degraded-capture recovery.** Multi-speaker bleed cases can recover through the ML diarization path when the evidence is strong enough, while single-speaker or weak evidence stays conservative.
+• **System-audio readiness checks.** Health output now reports backend-agnostic observed signals and capture warnings so missing or silent system audio is easier to diagnose before it ruins a meeting transcript.
+• **Experimental macOS Process Tap backend.** Advanced users can opt into `recording.capture_backend = "core-audio-tap"` for native Core Audio Process Tap capture on supported macOS systems. The existing `cpal` backend remains the default.
+• **Desktop polish.** Retry guidance, Parakeet setup messaging, capture-mode layout, brand mark stacking, and macOS window dragging all got sharper.
 
 **Setup:** `npx minutes-mcp` gets you search, browsing, and the dashboard right away. For recording and transcription, Minutes can auto-install the CLI on first use, or you can install it yourself with `brew install silverstein/tap/minutes` or `cargo install minutes-cli`, then run `minutes setup --model tiny`, `minutes setup --parakeet`, or `minutes setup --demo`.
 
