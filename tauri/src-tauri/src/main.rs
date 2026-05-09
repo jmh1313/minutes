@@ -927,6 +927,22 @@ fn spawn_meetings_refresh_watcher(app: &tauri::AppHandle, output_dir: std::path:
 }
 
 fn main() {
+    // Route whisper.cpp + ggml C-level logs through Rust `tracing` so they
+    // do not leak to raw stderr. The Tauri menu-bar app records audio in
+    // process and runs the same VAD path the CLI does, so the
+    // `whisper_vad_detect_speech` flood happens here too without this hook
+    // (issue #163). Install BEFORE the early-exit checks below: the
+    // process-queue worker (`maybe_run_process_queue_worker`) reaches
+    // `pipeline::transcribe_to_artifact` and spins up whisper contexts of
+    // its own, so the worker subprocess needs the same routing or it
+    // floods stderr while a recording is processing. The Tauri app
+    // currently has no `tracing_subscriber` installed; tracing events
+    // with no subscriber are dropped, which is the silencing behavior we
+    // want for the chatty C INFO logs. If a future change wires a
+    // subscriber into this process, set `whisper_rs=warn` and `ggml=warn`
+    // in the filter or the flood returns.
+    minutes_core::install_whisper_logging_hooks();
+
     #[cfg(target_os = "macos")]
     if let Some(code) = maybe_run_hotkey_diagnostic() {
         std::process::exit(code);

@@ -1213,12 +1213,26 @@ enum ContextAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    let log_level = if cli.verbose { "debug" } else { "info" };
+    // Initialize logging.
+    //
+    // Default filter: app code at INFO (or DEBUG with --verbose), but the
+    // whisper.cpp + ggml C-level loggers at WARN. The C loggers are chatty
+    // by default — `whisper_vad_detect_speech: detect speech (X.XXs duration)`
+    // fires roughly once per 100ms during a recording (issue #163). Demoting
+    // them to warn keeps real errors visible without flooding the terminal.
+    // RUST_LOG, when set, overrides this default entirely.
+    let app_level = if cli.verbose { "debug" } else { "info" };
+    let default_filter = format!("{app_level},whisper_rs=warn,ggml=warn");
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
     tracing_subscriber::fmt()
-        .with_env_filter(log_level)
+        .with_env_filter(env_filter)
         .with_target(false)
         .init();
+    // Route whisper.cpp + ggml stderr through the tracing subscriber we just
+    // installed. Safe to call multiple times; only the first call has effect.
+    // Without this, the C-level logs leak to raw stderr and bypass the filter.
+    minutes_core::install_whisper_logging_hooks();
 
     let mut config = Config::load();
     install_parakeet_panic_hook();

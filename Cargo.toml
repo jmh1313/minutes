@@ -27,7 +27,12 @@ cpal = { git = "https://github.com/RustAudio/cpal.git", rev = "8b152c39ea432a14b
 hound = "3.5"
 
 # Transcription
-whisper-rs = "0.16"
+# `tracing_backend` routes whisper.cpp + ggml C-level logs through the Rust
+# tracing subscriber so we can filter them like any other event. Without this,
+# the C `whisper_vad_detect_speech` line floods the user's terminal during a
+# recording (issue #163). Pair with `whisper_rs::install_logging_hooks()` at
+# process startup.
+whisper-rs = { version = "0.16", features = ["tracing_backend"] }
 
 # File watching
 notify = "7"

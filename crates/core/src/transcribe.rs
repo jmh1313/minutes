@@ -13,6 +13,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(feature = "parakeet")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "parakeet")]
 use std::sync::{Mutex, OnceLock};
 #[cfg(feature = "parakeet")]
 use std::time::Instant;
@@ -1740,6 +1742,7 @@ fn transcribe_with_parakeet(
                     })?,
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
+                    log_parakeet_helper_failure_once(&output.status, &stderr);
                     match run_parakeet_cli_structured(
                         resolved_binary_str,
                         &model_path,
@@ -1768,18 +1771,21 @@ fn transcribe_with_parakeet(
                         }
                     }
                 }
-                Err(_) => run_parakeet_cli_structured(
-                    resolved_binary_str,
-                    &model_path,
-                    tmp_wav.path(),
-                    &vocab_path,
-                    &config.transcription.parakeet_model,
-                    use_gpu,
-                    native_vad_path.as_deref(),
-                    PARAKEET_NATIVE_VAD_THRESHOLD,
-                    config,
-                    hints,
-                )?,
+                Err(spawn_error) => {
+                    log_parakeet_helper_spawn_failure_once(&spawn_error);
+                    run_parakeet_cli_structured(
+                        resolved_binary_str,
+                        &model_path,
+                        tmp_wav.path(),
+                        &vocab_path,
+                        &config.transcription.parakeet_model,
+                        use_gpu,
+                        native_vad_path.as_deref(),
+                        PARAKEET_NATIVE_VAD_THRESHOLD,
+                        config,
+                        hints,
+                    )?
+                }
             }
         } else {
             run_parakeet_cli_structured(
@@ -2119,6 +2125,80 @@ pub struct ParakeetWarmupStats {
 }
 
 // Word-to-sentence grouping is in crate::parakeet::group_word_segments
+
+/// Atomically take a one-shot "this is the first call" signal from a
+/// caller-owned gate. Returns `true` exactly once across the lifetime of
+/// the gate; subsequent calls return `false`.
+///
+/// Used by the parakeet-helper failure logging below to emit warn on the
+/// first failure of each kind per process and then go quiet so a long
+/// recording does not flood the log. Each distinct failure mode passes
+/// its own `static AtomicBool` so non-zero exit and spawn failure are
+/// gated independently.
+///
+/// Extracted as a free function (rather than inlined) so the
+/// loud-first-then-quiet semantics can be unit-tested with a non-static
+/// gate. The static gate would otherwise leak state across tests in the
+/// same process.
+#[cfg(feature = "parakeet")]
+fn loud_once(gate: &AtomicBool) -> bool {
+    !gate.swap(true, Ordering::Relaxed)
+}
+
+/// Log the FIRST helper-subprocess non-zero exit per process at warn level
+/// before falling back to direct invocation. Subsequent failures are
+/// silenced (debug only) to avoid log spam during a recording.
+///
+/// The motivation is issue #163: when `transcribe.rs` and the
+/// `ParakeetHelper` clap struct in `crates/cli/src/main.rs` disagree about
+/// what flags exist, the helper rejects every invocation and the code
+/// silently falls back to spawning parakeet directly. Without this warning,
+/// that kind of regression hides for arbitrary durations because the
+/// fallback path is functional. Loud first occurrence forces the failure
+/// onto someone's screen instead of into the void.
+#[cfg(feature = "parakeet")]
+fn log_parakeet_helper_failure_once(status: &std::process::ExitStatus, stderr: &str) {
+    static GATE: AtomicBool = AtomicBool::new(false);
+    let last_line = stderr.lines().last().unwrap_or("").trim();
+    if loud_once(&GATE) {
+        tracing::warn!(
+            exit_status = ?status,
+            stderr_tail = %last_line,
+            "parakeet-helper exited non-zero; falling back to direct subprocess. \
+             This message is logged once per process; subsequent failures will \
+             be debug-level. If you see this, check that every argv flag in \
+             transcribe::transcribe_with_parakeet is also accepted by the \
+             ParakeetHelper clap struct in crates/cli/src/main.rs (issue #163)."
+        );
+    } else {
+        tracing::debug!(
+            exit_status = ?status,
+            stderr_tail = %last_line,
+            "parakeet-helper exited non-zero (suppressed; first occurrence already logged)"
+        );
+    }
+}
+
+/// Companion to [`log_parakeet_helper_failure_once`] for the case where the
+/// helper subprocess could not be spawned at all (binary missing, permission
+/// denied, etc.). Same loud-first-then-quiet semantics.
+#[cfg(feature = "parakeet")]
+fn log_parakeet_helper_spawn_failure_once(error: &std::io::Error) {
+    static GATE: AtomicBool = AtomicBool::new(false);
+    if loud_once(&GATE) {
+        tracing::warn!(
+            error = %error,
+            "parakeet-helper spawn failed; falling back to direct subprocess. \
+             This message is logged once per process; subsequent failures will \
+             be debug-level."
+        );
+    } else {
+        tracing::debug!(
+            error = %error,
+            "parakeet-helper spawn failed (suppressed; first occurrence already logged)"
+        );
+    }
+}
 
 #[cfg(feature = "parakeet")]
 pub fn run_parakeet_cli_structured(
@@ -3575,5 +3655,41 @@ Hello there.
     fn parakeet_gpu_unavailable_matches_runtime_error() {
         assert!(parakeet_gpu_unavailable("Error: Metal GPU not available"));
         assert!(!parakeet_gpu_unavailable("Error: tokenizer file missing"));
+    }
+
+    /// Regression guard for the loud-once log gate that
+    /// `log_parakeet_helper_failure_once` and its spawn-failure twin rely
+    /// on. The original issue #163 stayed invisible to maintainers
+    /// partly because every helper failure was silently swallowed; the
+    /// fix logs warn on first failure and debug afterward. If a future
+    /// change weakens the gate (e.g. swaps `swap` for `load+store`,
+    /// breaking atomicity) the log volume during a real recording goes
+    /// back to one warn per audio chunk. This test exercises the gate
+    /// with a non-static AtomicBool so test order does not interfere.
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn loud_once_gate_signals_first_call_only() {
+        let gate = AtomicBool::new(false);
+        assert!(loud_once(&gate), "first call must signal loud");
+        assert!(!loud_once(&gate), "second call must signal quiet");
+        assert!(!loud_once(&gate), "third call must signal quiet");
+    }
+
+    /// Confirms the function treats each caller-owned gate independently.
+    /// This is a property of `loud_once` itself; it does NOT catch a
+    /// hypothetical regression where the production helpers
+    /// (`log_parakeet_helper_failure_once`,
+    /// `log_parakeet_helper_spawn_failure_once`) collapse onto a shared
+    /// static gate, because that would require introspecting the
+    /// production statics rather than the function's argument behavior.
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn loud_once_gates_are_independent_per_instance() {
+        let gate_a = AtomicBool::new(false);
+        let gate_b = AtomicBool::new(false);
+        assert!(loud_once(&gate_a));
+        assert!(loud_once(&gate_b), "second gate must fire independently");
+        assert!(!loud_once(&gate_a));
+        assert!(!loud_once(&gate_b));
     }
 }

@@ -83,6 +83,33 @@ pub use streaming::{AudioChunk, AudioStream};
 #[cfg(feature = "streaming")]
 pub use vad::{Vad, VadResult};
 
+/// Route whisper.cpp + ggml C-level logs through the Rust `tracing`
+/// subscriber instead of leaking to raw stderr. Without this hook the C
+/// loggers bypass every filter the host process sets up, which is what
+/// made the `whisper_vad_detect_speech: detect speech (X.XXs duration)`
+/// line flood terminals during a recording (issue #163).
+///
+/// **Call exactly once at process startup, before any whisper context is
+/// created.** The underlying `whisper_rs::install_logging_hooks()` wires a
+/// global C-level trampoline that is permanent for the life of the
+/// process and cannot be replaced. Subsequent calls are silently ignored,
+/// so this is safe to call defensively from multiple entry points (CLI
+/// main, Tauri main, MCP server) but each entry point should call it at
+/// most once.
+///
+/// If the host process has no tracing subscriber, the C log events
+/// become events with no recipient and are silently dropped. That is
+/// fine for the bug we are fixing here. If a future change adds a
+/// tracing subscriber to that process, set `whisper_rs=warn` and
+/// `ggml=warn` in the filter so the chatty INFO logs do not flood again.
+///
+/// On builds without the `whisper` feature this is a no-op so callers can
+/// invoke it unconditionally.
+pub fn install_whisper_logging_hooks() {
+    #[cfg(feature = "whisper")]
+    whisper_rs::install_logging_hooks();
+}
+
 #[cfg(test)]
 pub(crate) fn test_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::{Mutex, OnceLock};
