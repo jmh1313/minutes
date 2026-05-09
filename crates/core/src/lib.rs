@@ -49,6 +49,20 @@ pub mod streaming;
 #[cfg(feature = "streaming")]
 pub mod vad;
 
+// Silero VAD smoothing FSM. Independent of ort so unit tests cover
+// the smoothing logic with synthetic probability streams; the ort
+// session in `silero_vad` (when the `vad-ort` feature is on) feeds
+// real probabilities into the same FSM.
+#[cfg(feature = "streaming")]
+pub mod silero_smoothing;
+
+// Streaming Silero VAD via ort (ONNX Runtime). Only compiled when
+// the user opts into the `vad-ort` feature; default builds keep
+// using whisper-rs's bundled Silero (`SileroSidecarVad` in
+// `live_transcript`).
+#[cfg(feature = "vad-ort")]
+pub mod silero_vad;
+
 // Streaming whisper (progressive transcription) — requires both features.
 // These modules use whisper_rs + whisper_guard::params internally, so they
 // can only compile when the whisper backend is enabled. Downstream consumers

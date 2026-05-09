@@ -112,6 +112,15 @@ pub struct TranscriptionConfig {
     /// Silero VAD model name (resolved under model_path, e.g. "silero-v6.2.0" → ggml-silero-v6.2.0.bin).
     /// Set to empty string to disable VAD (falls back to energy-based silence stripping).
     pub vad_model: String,
+    /// VAD engine for the recording sidecar. Accepted: `"whisper-silero"`
+    /// (default; uses whisper-rs's bundled Silero, full-buffer rescan
+    /// per 100ms call), `"ort-silero"` (streaming Silero via ort,
+    /// O(new_audio) per call, requires the `vad-ort` build feature
+    /// AND `silero-vad-v6.2.0.onnx` in `model_path`). Unknown values
+    /// log a warning and fall through to `whisper-silero`. Energy is
+    /// the dispatcher's emergency fallback; not a user-selectable
+    /// engine here.
+    pub vad_engine: String,
     /// Enable noise reduction via nnnoiseless (RNNoise) before transcription.
     /// Requires the `denoise` feature flag. Default: true.
     pub noise_reduction: bool,
@@ -705,6 +714,7 @@ impl Default for TranscriptionConfig {
             min_words: 3,
             language: None,
             vad_model: "silero-v6.2.0".into(),
+            vad_engine: "whisper-silero".into(),
             noise_reduction: true,
             parakeet_binary: "parakeet".into(),
             parakeet_model: "tdt-600m".into(),

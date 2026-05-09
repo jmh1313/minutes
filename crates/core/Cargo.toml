@@ -21,6 +21,10 @@ metal = ["whisper-rs/metal"]
 vulkan = ["whisper-rs/vulkan"]
 streaming = ["dep:crossbeam-channel"]
 denoise = ["dep:nnnoiseless"]
+# Streaming Silero VAD via ort. Implies streaming because every consumer
+# (recording sidecar) needs streaming audio. ort + ndarray are already
+# pulled in by `diarize`; cargo unifies them when both features are on.
+vad-ort = ["streaming", "dep:ort", "dep:ndarray"]
 
 [dependencies]
 serde = { workspace = true }

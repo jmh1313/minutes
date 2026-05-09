@@ -4903,6 +4903,35 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
         }
     }
 
+    // Streaming Silero ONNX (used by the OrtSileroVad engine). Only
+    // downloaded when this build was compiled with the `vad-ort`
+    // feature, since builds without it cannot use the file.
+    //
+    // Naming note: the file is `silero-vad-v6.2.0.onnx` to mirror the
+    // existing ggml file naming convention used by ggml-org's whisper
+    // mirror. The actual upstream artifact is from the snakers4
+    // `v6.0` git tag — that's the most recent upstream release that
+    // ships the ONNX. Keep the URL pinned to a tag, never to a
+    // mutable branch, so the schema this code was written against
+    // (input [1,576], state [2,1,128], sr i64 scalar, output [1,1])
+    // stays stable.
+    #[cfg(feature = "vad-ort")]
+    {
+        let onnx_dest = model_dir.join("silero-vad-v6.2.0.onnx");
+        if !onnx_dest.exists() {
+            let onnx_url = "https://github.com/snakers4/silero-vad/raw/v6.0/src/silero_vad/data/silero_vad.onnx";
+            eprintln!("Downloading Silero VAD ONNX from snakers4 v6.0 tag (~2.3 MB) ...");
+            if let Err(e) = download_file(onnx_url, &onnx_dest) {
+                eprintln!(
+                    "Warning: Silero ONNX download failed ({}). The streaming VAD engine \
+                     will not be available; recordings will continue using whisper-rs's \
+                     bundled Silero.",
+                    e
+                );
+            }
+        }
+    }
+
     // Also list available input devices
     let devices = minutes_core::capture::list_input_devices();
     if !devices.is_empty() {

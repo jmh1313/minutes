@@ -1138,6 +1138,12 @@ impl SidecarGatingStats {
 #[cfg(feature = "whisper")]
 enum RecordingSidecarVadBackend {
     Silero(SileroSidecarVad),
+    /// Boxed because `OrtSileroVad` owns an ort `Session` plus state
+    /// and carry buffers, making it noticeably larger than the other
+    /// variants. Boxing keeps the enum size constant and silences
+    /// `clippy::large_enum_variant` without a per-variant allow.
+    #[cfg(feature = "vad-ort")]
+    OrtSilero(Box<crate::silero_vad::OrtSileroVad>),
     Energy(Vad),
 }
 
@@ -1149,12 +1155,71 @@ struct RecordingSidecarVad {
 #[cfg(feature = "whisper")]
 impl RecordingSidecarVad {
     fn new(config: &Config) -> Self {
+        // Pick the engine the user asked for. When ort-silero is
+        // requested but unavailable (feature off, ONNX missing, or
+        // load failure), fall through to whisper-silero with an
+        // explicit warn — silent fallback is the support footgun
+        // codex flagged in the spec review.
+        let requested = config.transcription.vad_engine.trim().to_lowercase();
+        let want_ort = matches!(requested.as_str(), "ort-silero" | "ort" | "silero-ort");
+        if !requested.is_empty()
+            && !want_ort
+            && !matches!(
+                requested.as_str(),
+                "whisper-silero" | "silero" | "whisper" | "default"
+            )
+        {
+            tracing::warn!(
+                requested = %requested,
+                "unknown transcription.vad_engine value — falling through to whisper-silero"
+            );
+        }
+
+        #[cfg(feature = "vad-ort")]
+        if want_ort {
+            if let Some(onnx_path) = crate::transcribe::resolve_silero_onnx_path(config) {
+                match crate::silero_vad::OrtSileroVad::new(&onnx_path) {
+                    Ok(engine) => {
+                        tracing::info!(
+                            vad_engine = "ort-silero",
+                            onnx_model = %onnx_path.display(),
+                            "recording sidecar using ort-Silero VAD (streaming)"
+                        );
+                        return Self {
+                            backend: RecordingSidecarVadBackend::OrtSilero(Box::new(engine)),
+                        };
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            onnx_model = %onnx_path.display(),
+                            error = %e,
+                            "ort-Silero load failed — falling back to whisper-silero"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "ort-silero requested but silero-vad-v6.2.0.onnx missing in model_path — \
+                     falling back to whisper-silero. Run `minutes setup` (with vad-ort enabled \
+                     in your build) to fetch the ONNX."
+                );
+            }
+        }
+        #[cfg(not(feature = "vad-ort"))]
+        if want_ort {
+            tracing::warn!(
+                "ort-silero requested but this build was not compiled with the `vad-ort` \
+                 feature — falling back to whisper-silero"
+            );
+        }
+
         if let Some(vad_path) = crate::transcribe::resolve_vad_model_path(config) {
             match SileroSidecarVad::new(&vad_path) {
                 Ok(vad) => {
                     tracing::info!(
+                        vad_engine = "whisper-silero",
                         vad_model = %vad_path.display(),
-                        "recording sidecar using Silero VAD"
+                        "recording sidecar using whisper-Silero VAD"
                     );
                     return Self {
                         backend: RecordingSidecarVadBackend::Silero(vad),
@@ -1174,6 +1239,7 @@ impl RecordingSidecarVad {
             );
         }
 
+        tracing::info!(vad_engine = "energy", "recording sidecar using energy VAD");
         Self {
             backend: RecordingSidecarVadBackend::Energy(Vad::new()),
         }
@@ -1182,6 +1248,8 @@ impl RecordingSidecarVad {
     fn mode_name(&self) -> &'static str {
         match &self.backend {
             RecordingSidecarVadBackend::Silero(_) => "silero",
+            #[cfg(feature = "vad-ort")]
+            RecordingSidecarVadBackend::OrtSilero(_) => "ort-silero",
             RecordingSidecarVadBackend::Energy(_) => "energy",
         }
     }
@@ -1199,6 +1267,23 @@ impl RecordingSidecarVad {
                         self.backend = RecordingSidecarVadBackend::Energy(Vad::new());
                     }
                 },
+                #[cfg(feature = "vad-ort")]
+                RecordingSidecarVadBackend::OrtSilero(engine) => {
+                    let result = engine.process(samples, rms);
+                    if engine.is_healthy() {
+                        return result;
+                    }
+                    // Engine flipped unhealthy mid-call. Replace and
+                    // re-dispatch on the next loop iteration. The
+                    // result we just got is one silence frame; per
+                    // the trait contract, downstream must not act on
+                    // it as authoritative, but for the sidecar's
+                    // per-call flag it's fine to drop and refresh.
+                    tracing::warn!(
+                        "ort-Silero engine flipped unhealthy during recording sidecar run — falling back to energy VAD"
+                    );
+                    self.backend = RecordingSidecarVadBackend::Energy(Vad::new());
+                }
                 RecordingSidecarVadBackend::Energy(vad) => return vad.process(rms),
             }
         }
@@ -2857,6 +2942,175 @@ mod tests {
         );
         silero.force_failed_for_test(true);
         assert!(!<SileroSidecarVad as VadEngine>::is_healthy(&silero));
+    }
+
+    /// Parity test: feed `crates/assets/demo.wav` through both
+    /// OrtSileroVad and the existing whisper-Silero at the
+    /// production 100 ms cadence, then check the codex-tightened bar
+    /// from PLAN-vad-refactor.md:
+    ///
+    /// - Zero missed speech islands. Every contiguous speech region
+    ///   whisper-Silero flags must also be flagged by ort-Silero.
+    ///   Utterance loss is a release-blocking regression.
+    /// - Boundary drift up to ±150 ms tolerable; here we use ±200 ms
+    ///   (2 chunks at 100 ms cadence) to keep the test stable across
+    ///   minor model updates.
+    /// - No phantom speech. ort-Silero must not flag speech that is
+    ///   not within ±200 ms of some whisper-Silero island.
+    ///
+    /// `#[ignore]` because it requires both the ONNX model and the
+    /// whisper ggml model. Run with:
+    ///
+    ///   cargo test -p minutes-core --features "whisper streaming
+    ///   vad-ort" --lib live_transcript::tests::parity_with_whisper
+    ///   -- --ignored --nocapture
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_ort_silero_vs_whisper_silero_on_demo_wav() {
+        use crate::silero_vad::OrtSileroVad;
+        use crate::vad::VadEngine;
+
+        let onnx_path = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/silero-vad-v6.2.0.onnx");
+        let ggml_path = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/ggml-silero-v6.2.0.bin");
+        if !onnx_path.exists() || !ggml_path.exists() {
+            eprintln!(
+                "[parity] skipping: need both {} and {}",
+                onnx_path.display(),
+                ggml_path.display()
+            );
+            return;
+        }
+
+        let cargo_manifest = env!("CARGO_MANIFEST_DIR");
+        let demo_wav = std::path::PathBuf::from(cargo_manifest)
+            .parent()
+            .expect("crate parent")
+            .join("assets/demo.wav");
+        if !demo_wav.exists() {
+            eprintln!("[parity] no demo.wav at {}", demo_wav.display());
+            return;
+        }
+
+        let samples = read_wav_samples(&demo_wav);
+        eprintln!(
+            "[parity] loaded {} samples ({:.1}s at 16kHz)",
+            samples.len(),
+            samples.len() as f32 / 16_000.0
+        );
+
+        let mut ort_engine = OrtSileroVad::new(&onnx_path).unwrap();
+        let mut whisper_engine = SileroSidecarVad::new(&ggml_path).unwrap();
+
+        // 100 ms cadence matches the recording sidecar.
+        let chunk = 1600;
+        let mut ort_speak: Vec<bool> = Vec::new();
+        let mut whisper_speak: Vec<bool> = Vec::new();
+        for window in samples.chunks(chunk) {
+            let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+            let ort = ort_engine.process(window, rms);
+            let wh = whisper_engine.process(window, rms).unwrap();
+            ort_speak.push(ort.speaking);
+            whisper_speak.push(wh.speaking);
+        }
+
+        let islands = contiguous_runs(&whisper_speak, true);
+        let ort_islands = contiguous_runs(&ort_speak, true);
+        eprintln!(
+            "[parity] whisper-silero islands: {} | ort-silero islands: {} | ort speaking windows: {}/{}",
+            islands.len(),
+            ort_islands.len(),
+            ort_speak.iter().filter(|&&s| s).count(),
+            ort_speak.len()
+        );
+
+        // Bar 1: zero missed islands.
+        for (start, end) in &islands {
+            let any_overlap = ort_speak[*start..*end].iter().any(|&s| s);
+            assert!(
+                any_overlap,
+                "ort-silero missed an entire speech island at chunks [{},{}) ({:.1}s-{:.1}s) — \
+                 release-blocking regression",
+                start,
+                end,
+                *start as f32 * 0.1,
+                *end as f32 * 0.1
+            );
+        }
+
+        // Bar 2: boundary drift within ±200 ms (2 chunks).
+        const DRIFT_TOLERANCE_CHUNKS: i64 = 2;
+        for (start, end) in &islands {
+            let nearest_start = ort_speak
+                .iter()
+                .enumerate()
+                .filter(|(_, &s)| s)
+                .map(|(i, _)| (i as i64 - *start as i64).abs())
+                .min()
+                .unwrap_or(i64::MAX);
+            let nearest_end = ort_speak
+                .iter()
+                .enumerate()
+                .filter(|(_, &s)| s)
+                .map(|(i, _)| (i as i64 - (*end as i64 - 1)).abs())
+                .min()
+                .unwrap_or(i64::MAX);
+            assert!(
+                nearest_start <= DRIFT_TOLERANCE_CHUNKS,
+                "island start at chunk {} ({:.1}s): nearest ort-silero speech is {} chunks away (>200ms drift)",
+                start,
+                *start as f32 * 0.1,
+                nearest_start
+            );
+            assert!(
+                nearest_end <= DRIFT_TOLERANCE_CHUNKS,
+                "island end at chunk {} ({:.1}s): nearest ort-silero speech is {} chunks away (>200ms drift)",
+                end,
+                *end as f32 * 0.1,
+                nearest_end
+            );
+        }
+
+        // Bar 3: no phantom speech outside ±200 ms of any island.
+        for (i, &is_speaking) in ort_speak.iter().enumerate() {
+            if !is_speaking {
+                continue;
+            }
+            let inside_or_near = islands.iter().any(|(s, e)| {
+                let near_start = (*s as i64 - i as i64).abs() <= DRIFT_TOLERANCE_CHUNKS;
+                let near_end = (i as i64 - (*e as i64 - 1)).abs() <= DRIFT_TOLERANCE_CHUNKS;
+                let inside = i >= *s && i < *e;
+                inside || near_start || near_end
+            });
+            assert!(
+                inside_or_near,
+                "phantom ort-silero speech at chunk {} ({:.1}s) — \
+                 not within ±200ms of any whisper-silero island",
+                i,
+                i as f32 * 0.1
+            );
+        }
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    fn contiguous_runs(seq: &[bool], value: bool) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        let mut start: Option<usize> = None;
+        for (i, &v) in seq.iter().enumerate() {
+            if v == value && start.is_none() {
+                start = Some(i);
+            } else if v != value && start.is_some() {
+                runs.push((start.take().unwrap(), i));
+            }
+        }
+        if let Some(s) = start {
+            runs.push((s, seq.len()));
+        }
+        runs
     }
 
     /// SPIKE — does whisper-rs's Silero VAD carry LSTM state across

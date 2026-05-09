@@ -1548,6 +1548,34 @@ pub(crate) fn resolve_vad_model_path(config: &Config) -> Option<PathBuf> {
     None
 }
 
+/// Resolve the Silero ONNX path used by the streaming `OrtSileroVad`
+/// engine. Returns None if the file is missing — caller falls back to
+/// whisper-Silero with an explicit warn-level log so the user knows
+/// they opted into ort-silero but didn't get it.
+///
+/// The file name mirrors `vad_model` (the ggml form) but with `.onnx`
+/// extension, so a single `vad_model = "silero-v6.2.0"` config drives
+/// both engines' resolution.
+#[cfg(all(feature = "whisper", feature = "vad-ort"))]
+pub(crate) fn resolve_silero_onnx_path(config: &Config) -> Option<PathBuf> {
+    let vad_model = &config.transcription.vad_model;
+    if vad_model.is_empty() {
+        return None;
+    }
+    let model_dir = &config.transcription.model_path;
+    let candidates = [
+        model_dir.join(format!("{}.onnx", vad_model)),
+        model_dir.join("silero-vad-v6.2.0.onnx"),
+        model_dir.join("silero_vad.onnx"),
+    ];
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
 // default_whisper_params, streaming_whisper_params, and num_cpus
 // are re-exported from whisper_guard::params via `pub use` at the top of this file.
 #[cfg(feature = "whisper")]

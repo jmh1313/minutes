@@ -19,6 +19,9 @@ path = "src/main.rs"
 default = ["diarize"]
 diarize = ["minutes-core/diarize", "dep:pyannote-rs", "dep:ort", "dep:symphonia"]
 parakeet = ["minutes-core/parakeet"]
+# Streaming Silero VAD via ort. Pulls minutes-core's vad-ort. Also
+# wires the setup-time download for silero-vad-v6.2.0.onnx.
+vad-ort = ["minutes-core/vad-ort", "dep:ort"]
 coreml = ["minutes-core/coreml"]
 cuda = ["minutes-core/cuda"]
 hipblas = ["minutes-core/hipblas"]
