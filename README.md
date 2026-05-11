@@ -104,6 +104,8 @@ minutes record --template standup                 # Apply a summary template
 minutes stop                                      # Stop from another terminal
 ```
 
+**Recording calls (Zoom, Meet, Teams, Webex):** macOS does not let apps capture system audio directly, so the default mic-only recording only picks up your own voice. To capture the other side of the call too, install BlackHole and route the call through a Multi-Output Device. Full setup in [`docs/audio-devices.md`](docs/audio-devices.md).
+
 ### Take notes during meetings
 ```bash
 minutes note "Alex wants monthly billing not annual billing"          # Timestamped, feeds into summary
