@@ -2,7 +2,7 @@
 
 > Generated file. Do not edit by hand.
 > Source: manifest.json + crates/mcp/src/index.ts + site/lib/skills-catalog.json
-> Last generated: 2026-05-09
+> Last generated: 2026-05-11
 
 ## Product
 
@@ -10,12 +10,12 @@ Minutes is an open-source meeting corpus you own. Record, transcribe, search, an
 
 29 tools • 7 resources • Interactive MCP App dashboard • Prompt templates
 
-**What's new in 0.16.5:**
-• **Lower CPU during recording.** Three independent fixes on the audio hot path: per-callback heap allocations eliminated, atomic op rate cut from 16,000/s to ~100/s, and a configurable cap on streaming-whisper partial transcription that stops the runaway condition during long monologues.
-• **Status polling no longer scales with meeting count.** Terminal jobs now move to `~/.minutes/jobs/archive/` on completion, and the UI status poll scans the directory once per call instead of three times. Power users with hundreds of accumulated meetings should feel the menu-bar app become noticeably lighter.
-• **Parakeet integration on Apple Silicon now actually uses parakeet.** A clap parse mismatch had been silently rejecting `--fp16` on every utterance, falling back to direct subprocess invocation, and surfacing as "switching to whisper" on Ctrl+C. Fix is on by default; manual `minutes parakeet-helper` invocations continue to honor your TOML.
-• **Whisper VAD chatter no longer floods stderr.** C-level whisper.cpp logs now route through the Rust tracing subscriber where they can be filtered like any other event. The CLI demotes the chatty INFO logs to warn level by default; RUST_LOG still wins.
-• **Loud-on-failure for the parakeet helper path.** Helper subprocess failures now log a single warn on first occurrence per process so this class of regression cannot stay silent again.
+**What's new in 0.17.0:**
+• **Streaming Silero VAD (opt-in via vad-ort feature).** New ONNX-runtime-backed VAD engine that maintains LSTM state across calls. Cost per chunk drops from O(buffer_len) to O(new_audio). End-to-end recording sidecar is 2x to 2.5x faster on real meeting audio in internal dogfood (20-WAV stratified screen). Brief noise spikes under 150ms are correctly filtered. Marked experimental in the doc comment until the 30% substantive regression rate on the dogfood (mostly longer-chunk named-entity drift) is addressed. Opt out via `transcription.vad_engine = "whisper-silero"`.
+• **cpal bumped to upstream HEAD (53 commits).** macOS now reroutes streams when the default output device changes mid-recording (e.g., AirPods disconnect). PipeWire handles disconnection errors and default-device changes correctly on Linux. WASAPI auto-reroutes on Windows. Cross-platform RT scheduling without dbus dependency.
+• **Menu-bar Stop button now works from any source.** Previously the tray's Stop item was disabled whenever a recording started from anywhere other than the tray itself (main window, hotkey, CLI, call-detect, palette). Centralized the menu state through a single state-driven function. Also wired dictation and live transcript into the tray Stop handler; the menu label adapts to whatever's active.
+• **Tray icons swap per system appearance.** Light-mode and dark-mode variants of the recording and live transcript icons ship as separate PNGs and swap at runtime on macOS appearance changes. The previous cream-on-light readability bug surfaced by allaire on issue #223 is gone.
+• **Plus all of 0.16.5's CPU and parakeet fixes** for users skipping that release: lower CPU during recording, status polling no longer scales with meeting count, parakeet `--fp16` integration fixed, whisper VAD chatter routes through tracing.
 
 **Also new in the 0.16 line:**
 • **Safer call-capture diarization.** Silent or degraded system stems no longer produce noisy `[UNKNOWN]` speaker spam. Minutes preserves the transcript and records structured capture-health metadata when diarization should be skipped.
