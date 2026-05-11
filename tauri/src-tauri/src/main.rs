@@ -1202,7 +1202,20 @@ fn main() {
     }
 
     if let Some(code) = maybe_run_process_queue_worker() {
-        std::process::exit(code);
+        // Worker subprocess exit: skip C++ static teardown on macOS.
+        //
+        // Letting `main` return (or calling `std::process::exit`) runs
+        // `atexit` handlers and C++ static destructors via
+        // `__cxa_finalize_ranges`. whisper.cpp / ggml / parakeet helpers
+        // register global C++ state whose destructors can call `abort()`
+        // on partially-initialized contexts (issue #229: a transcription
+        // spawn failure left a context in a bad state, then the normal
+        // exit path crashed the worker via SIGABRT inside
+        // `__cxa_finalize_ranges`). `_exit` skips that teardown
+        // entirely; we drain the sidecar manager explicitly above and
+        // rely on the OS to reclaim the rest.
+        minutes_core::parakeet_sidecar::shutdown_global_parakeet_sidecar();
+        exit_process_without_destructors(code);
     }
 
     // Load with first-run and upgrade migrations so palette defaults

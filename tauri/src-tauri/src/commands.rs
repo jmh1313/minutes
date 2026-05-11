@@ -3172,7 +3172,10 @@ fn startup_retryable_notice_is_recent(job: &minutes_core::jobs::ProcessingJob) -
 }
 
 fn latest_retryable_output_notice() -> Option<OutputNotice> {
-    let mut jobs = minutes_core::jobs::list_jobs()
+    // Include archive: retry-cap demotions in `list_jobs()` move Failed
+    // jobs across the active/archive boundary (issue #229), so a
+    // `list_jobs()`-only scan would silently miss them on startup.
+    let mut jobs = minutes_core::jobs::display_jobs(None, true)
         .into_iter()
         .filter(|job| {
             matches!(
@@ -9693,6 +9696,7 @@ mod tests {
             template_slug: None,
             word_count: Some(0),
             owner_pid: None,
+            retry_count: 0,
             recording_health: None,
         };
 
@@ -9727,6 +9731,7 @@ mod tests {
             template_slug: None,
             word_count: Some(0),
             owner_pid: None,
+            retry_count: 0,
             recording_health: None,
         };
 
@@ -9771,6 +9776,7 @@ mod tests {
                 template_slug: None,
                 word_count: Some(0),
                 owner_pid: None,
+                retry_count: 0,
                 recording_health: None,
             };
 
@@ -9809,6 +9815,7 @@ mod tests {
                 template_slug: None,
                 word_count: Some(0),
                 owner_pid: None,
+                retry_count: 0,
                 recording_health: None,
             };
             let older_job = minutes_core::jobs::ProcessingJob {
@@ -9834,6 +9841,7 @@ mod tests {
                 template_slug: None,
                 word_count: Some(0),
                 owner_pid: None,
+                retry_count: 0,
                 recording_health: None,
             };
 
@@ -9873,6 +9881,7 @@ mod tests {
                 template_slug: None,
                 word_count: Some(0),
                 owner_pid: None,
+                retry_count: 0,
                 recording_health: None,
             };
             minutes_core::jobs::write_job(&job).unwrap();
@@ -9913,6 +9922,7 @@ mod tests {
                 template_slug: None,
                 word_count: Some(0),
                 owner_pid: None,
+                retry_count: 0,
                 recording_health: None,
             };
             minutes_core::jobs::write_job(&job).unwrap();
@@ -9969,6 +9979,7 @@ mod tests {
                 template_slug: None,
                 word_count: Some(0),
                 owner_pid: None,
+                retry_count: 0,
                 recording_health: None,
             };
             minutes_core::jobs::write_job(&job).unwrap();

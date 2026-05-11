@@ -1,6 +1,6 @@
 use crate::calendar::CalendarEvent;
 use crate::config::Config;
-use crate::error::MinutesError;
+use crate::error::{MinutesError, TranscribeError};
 use crate::markdown::{ContentType, OutputStatus};
 use crate::pid::{self, CaptureMode, PidGuard};
 use crate::pipeline::{self, BackgroundPipelineContext, PipelineStage};
@@ -8,8 +8,20 @@ use chrono::{DateTime, Local};
 use serde_json::json;
 use std::fs;
 use std::io::ErrorKind;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Upper bound on automatic stale-claim retries before a job is marked
+/// permanently `Failed`. Protects against deterministic crashes (issue #229:
+/// a SIGABRT inside whisper.cpp / `__cxa_finalize_ranges` left the job
+/// orphaned with `owner_pid` set; `list_jobs()` would reset to `Queued` and
+/// the next worker would crash the same way, in a loop).
+///
+/// The counter advances each time a non-terminal job is observed with a dead
+/// `owner_pid`. A user-initiated `requeue_job` resets it so a manual retry
+/// after fixing the underlying issue always gets a fresh budget.
+pub const MAX_AUTO_RETRIES: u32 = 2;
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -100,6 +112,14 @@ pub struct ProcessingJob {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_pid: Option<u32>,
+    /// Number of times this job has been auto-recovered from a stale
+    /// `owner_pid` claim. `list_jobs()` increments this each time it observes
+    /// a non-terminal job whose worker is dead; once it reaches
+    /// `MAX_AUTO_RETRIES` the job is demoted to `Failed` instead of being
+    /// reset to `Queued`, so a deterministic worker crash cannot loop
+    /// forever (issue #229). Reset to 0 by `requeue_job` on a manual retry.
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 fn next_job_id() -> String {
@@ -107,6 +127,19 @@ fn next_job_id() -> String {
     let pid = std::process::id();
     let counter = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("job-{}-{}-{}", ts, pid, counter)
+}
+
+/// Best-effort string form of a `catch_unwind` payload. Most panics carry a
+/// `&'static str` or a `String`; fall back to a generic label otherwise so
+/// the failed-job record still has something meaningful for the user.
+fn describe_panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "panic payload was not a string".to_string()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -179,6 +212,7 @@ pub fn queue_live_capture_with_recording_health(
         word_count: None,
         error: None,
         owner_pid: None,
+        retry_count: 0,
     };
     if let Err(error) = write_job(&job) {
         if audio_path.exists() {
@@ -359,6 +393,7 @@ pub fn enqueue_capture_job(
         word_count: None,
         error: None,
         owner_pid: None,
+        retry_count: 0,
     };
     write_job(&job)?;
     maybe_mark_context_session_processing(&job, Path::new(&job.audio_path));
@@ -716,31 +751,66 @@ fn move_to_archive(source: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 pub fn list_jobs() -> Vec<ProcessingJob> {
-    let mut changed = false;
-    let jobs = list_jobs_raw()
-        .into_iter()
-        .map(|mut job| {
-            if !job.state.is_terminal()
+    // Collect just the IDs that look stale in this snapshot. Recovery
+    // itself is delegated to `update_job_state`, which reloads the latest
+    // disk state inside its read-modify-write — so a worker that claimed
+    // the job between this scan and the recovery call is not silently
+    // clobbered (codex review of issue #229: two races where a stale
+    // in-memory copy could overwrite a concurrent claim or an
+    // intervening update).
+    let snapshot = list_jobs_raw();
+    let recovery_candidates: Vec<String> = snapshot
+        .iter()
+        .filter(|job| {
+            !job.state.is_terminal()
                 && job.owner_pid.is_some()
                 && !job.owner_pid.map(pid::is_process_alive).unwrap_or(false)
-            {
-                job.state = JobState::Queued;
-                job.stage = JobState::Queued.default_stage();
-                job.owner_pid = None;
-                job.started_at = None;
-                changed = true;
-            }
-            job
         })
-        .collect::<Vec<_>>();
+        .map(|job| job.id.clone())
+        .collect();
 
-    if changed {
-        for job in &jobs {
-            let _ = write_job(job);
-        }
+    for id in &recovery_candidates {
+        let _ = update_job_state(id, |current| {
+            // Re-check on the fresh disk record: a concurrent worker may
+            // have claimed it after our snapshot, or another `list_jobs`
+            // caller may have already recovered it. Both are no-ops here.
+            if current.state.is_terminal()
+                || current.owner_pid.is_none()
+                || current
+                    .owner_pid
+                    .map(pid::is_process_alive)
+                    .unwrap_or(false)
+            {
+                return;
+            }
+            current.retry_count = current.retry_count.saturating_add(1);
+            current.owner_pid = None;
+            current.started_at = None;
+            if current.retry_count > MAX_AUTO_RETRIES {
+                current.state = JobState::Failed;
+                current.stage = JobState::Failed.default_stage();
+                current.finished_at = Some(Local::now());
+                if current.error.is_none() {
+                    current.error = Some(format!(
+                        "transcription worker crashed {} times without producing output; left as Failed for manual retry",
+                        current.retry_count
+                    ));
+                }
+            } else {
+                current.state = JobState::Queued;
+                current.stage = JobState::Queued.default_stage();
+            }
+        });
     }
 
-    jobs
+    // If we recovered anything, re-read so callers see the post-recovery
+    // state. Most polls have an empty candidate list so this branch is
+    // skipped and we return the original cheap snapshot.
+    if recovery_candidates.is_empty() {
+        snapshot
+    } else {
+        list_jobs_raw()
+    }
 }
 
 pub fn display_jobs(limit: Option<usize>, include_terminal: bool) -> Vec<ProcessingJob> {
@@ -803,6 +873,10 @@ pub fn requeue_job(job_id: &str) -> std::io::Result<Option<ProcessingJob>> {
         job.notice_dismissed_at = None;
         job.error = None;
         job.owner_pid = None;
+        // Manual requeue is the user explicitly retrying after looking at
+        // the failure; give them a fresh auto-retry budget so a future
+        // transient crash doesn't get masked by leftover counter state.
+        job.retry_count = 0;
     })?
     else {
         return Ok(None);
@@ -1089,16 +1163,26 @@ where
         let audio_path = PathBuf::from(&job.audio_path);
         let context = job_context(&job);
 
-        let artifact = match pipeline::transcribe_to_artifact(
-            &audio_path,
-            job.content_type,
-            job.title.as_deref(),
-            config,
-            &context,
-            job.output_path.as_deref().map(Path::new),
-        ) {
-            Ok(artifact) => artifact,
-            Err(error) => {
+        // Run transcription inside `catch_unwind` so a Rust panic in any of
+        // the heavy native paths (whisper.cpp FFI, parakeet helper, audio
+        // decode) surfaces as a normal `Err` here instead of unwinding
+        // through the worker. The macOS `_exit` path in
+        // `tauri/src-tauri/src/main.rs` separately prevents the
+        // C++-static-teardown abort during process exit; the two together
+        // are what stop SIGABRT from reaching the UI (issue #229).
+        let transcribe_outcome = catch_unwind(AssertUnwindSafe(|| {
+            pipeline::transcribe_to_artifact(
+                &audio_path,
+                job.content_type,
+                job.title.as_deref(),
+                config,
+                &context,
+                job.output_path.as_deref().map(Path::new),
+            )
+        }));
+        let artifact = match transcribe_outcome {
+            Ok(Ok(artifact)) => artifact,
+            Ok(Err(error)) => {
                 let Some(failed_job) = update_job_state(&job.id, |job| {
                     job.state = JobState::Failed;
                     job.stage = JobState::Failed.default_stage();
@@ -1111,6 +1195,32 @@ where
                     continue;
                 };
                 maybe_mark_context_session_failed(&failed_job, &error.to_string(), None);
+                sync_processing_status();
+                on_job_update(&failed_job);
+                continue;
+            }
+            Err(payload) => {
+                let message = format!(
+                    "transcription worker panicked: {}",
+                    describe_panic_payload(payload.as_ref())
+                );
+                tracing::error!(
+                    job_id = %job.id,
+                    error = %message,
+                    "transcription worker caught panic"
+                );
+                let Some(failed_job) = update_job_state(&job.id, |job| {
+                    job.state = JobState::Failed;
+                    job.stage = JobState::Failed.default_stage();
+                    job.finished_at = Some(Local::now());
+                    job.error = Some(message.clone());
+                    job.owner_pid = None;
+                })?
+                else {
+                    sync_processing_status();
+                    continue;
+                };
+                maybe_mark_context_session_failed(&failed_job, &message, None);
                 sync_processing_status();
                 on_job_update(&failed_job);
                 continue;
@@ -1172,22 +1282,45 @@ where
         sync_processing_status();
         on_job_update(&job);
 
-        let enrich_result = pipeline::enrich_transcript_artifact(
-            &audio_path,
-            &artifact,
-            config,
-            &context,
-            |stage| {
-                let state = stage_state(stage);
-                if let Ok(Some(job)) = update_job_state(&job.id, |job| {
-                    job.state = state;
-                    job.stage = state.default_stage();
-                }) {
-                    sync_processing_status();
-                    on_job_update(&job);
-                }
-            },
-        );
+        // Same `catch_unwind` rationale as the transcribe call above: the
+        // enrich path runs the LLM summarizer, diarization, and graph
+        // updates, any of which can panic in native or third-party code.
+        // We want a clean `Failed` job, not a crashed worker (issue #229).
+        let enrich_outcome = catch_unwind(AssertUnwindSafe(|| {
+            pipeline::enrich_transcript_artifact(
+                &audio_path,
+                &artifact,
+                config,
+                &context,
+                |stage| {
+                    let state = stage_state(stage);
+                    if let Ok(Some(job)) = update_job_state(&job.id, |job| {
+                        job.state = state;
+                        job.stage = state.default_stage();
+                    }) {
+                        sync_processing_status();
+                        on_job_update(&job);
+                    }
+                },
+            )
+        }));
+        let enrich_result = match enrich_outcome {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = format!(
+                    "enrichment worker panicked: {}",
+                    describe_panic_payload(payload.as_ref())
+                );
+                tracing::error!(
+                    job_id = %job.id,
+                    error = %message,
+                    "enrichment worker caught panic"
+                );
+                Err(MinutesError::Transcribe(
+                    TranscribeError::TranscriptionFailed(message),
+                ))
+            }
+        };
 
         match enrich_result {
             Ok(result) => {
@@ -1421,6 +1554,7 @@ mod tests {
                 word_count: None,
                 error: None,
                 owner_pid: None,
+                retry_count: 0,
             };
             write_job(&job).unwrap();
 
@@ -1509,6 +1643,7 @@ mod tests {
                 word_count: None,
                 error: None,
                 owner_pid: Some(99_999_999),
+                retry_count: 0,
             };
             write_job(&job).unwrap();
 
@@ -1516,6 +1651,103 @@ mod tests {
             assert_eq!(jobs.len(), 1);
             assert_eq!(jobs[0].state, JobState::Queued);
             assert_eq!(jobs[0].owner_pid, None);
+            assert_eq!(jobs[0].retry_count, 1);
+        });
+    }
+
+    #[test]
+    fn list_jobs_demotes_to_failed_when_retry_cap_exceeded() {
+        with_temp_home(|_| {
+            // Already burned every auto-retry slot. A worker that died after
+            // claiming this job should not get a fresh `Queued` chance —
+            // that's exactly the "loop forever on a deterministic crash"
+            // case from issue #229.
+            let job = ProcessingJob {
+                id: "job-burned".into(),
+                mode: CaptureMode::Meeting,
+                content_type: ContentType::Meeting,
+                title: Some("burned".into()),
+                audio_path: "/tmp/fake.wav".into(),
+                output_path: None,
+                state: JobState::Transcribing,
+                stage: Some("Transcribing meeting".into()),
+                created_at: Local::now(),
+                started_at: Some(Local::now()),
+                finished_at: None,
+                notice_dismissed_at: None,
+                recording_started_at: None,
+                recording_finished_at: None,
+                context_session_id: None,
+                user_notes: None,
+                pre_context: None,
+                calendar_event: None,
+                template_slug: None,
+                recording_health: None,
+                word_count: None,
+                error: None,
+                owner_pid: Some(99_999_999),
+                retry_count: MAX_AUTO_RETRIES,
+            };
+            write_job(&job).unwrap();
+
+            // Trigger the recovery scan. The demoted job moves into the
+            // archive so it no longer shows up in `list_jobs()` (which
+            // only walks the active dir); verify the final state by
+            // reading the archived record directly.
+            let _ = list_jobs();
+
+            let recovered = load_job(&job.id).expect("archived job should be loadable");
+            assert_eq!(recovered.state, JobState::Failed);
+            assert_eq!(recovered.owner_pid, None);
+            assert_eq!(recovered.retry_count, MAX_AUTO_RETRIES + 1);
+            assert!(recovered
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("crashed")));
+
+            // The active copy should be gone — `update_job_state` moves it
+            // across the boundary on terminal transition.
+            assert!(!job_path(&job.id).exists());
+            assert!(job_archive_path(&job.id).exists());
+        });
+    }
+
+    #[test]
+    fn manual_requeue_resets_retry_count() {
+        with_temp_home(|dir| {
+            let audio_path = dir.path().join("fake.wav");
+            let job = ProcessingJob {
+                id: "job-retry-reset".into(),
+                mode: CaptureMode::Meeting,
+                content_type: ContentType::Meeting,
+                title: Some("retry reset".into()),
+                audio_path: audio_path.display().to_string(),
+                output_path: None,
+                state: JobState::Failed,
+                stage: Some("Processing failed".into()),
+                created_at: Local::now(),
+                started_at: Some(Local::now()),
+                finished_at: Some(Local::now()),
+                notice_dismissed_at: None,
+                recording_started_at: None,
+                recording_finished_at: None,
+                context_session_id: None,
+                user_notes: None,
+                pre_context: None,
+                calendar_event: None,
+                template_slug: None,
+                recording_health: None,
+                word_count: None,
+                error: Some("crashed three times".into()),
+                owner_pid: None,
+                retry_count: MAX_AUTO_RETRIES + 1,
+            };
+            write_job(&job).unwrap();
+            fs::write(&audio_path, b"fake-wav").unwrap();
+
+            let requeued = requeue_job(&job.id).unwrap().unwrap();
+            assert_eq!(requeued.state, JobState::Queued);
+            assert_eq!(requeued.retry_count, 0);
         });
     }
 
@@ -1548,6 +1780,7 @@ mod tests {
                 word_count: Some(42),
                 error: Some("boom".into()),
                 owner_pid: None,
+                retry_count: 0,
             };
             write_job(&job).unwrap();
             fs::write(&audio_path, b"fake-wav").unwrap();
@@ -1591,6 +1824,7 @@ mod tests {
                 word_count: None,
                 error: Some("boom".into()),
                 owner_pid: None,
+                retry_count: 0,
             };
             write_job(&job).unwrap();
 
@@ -1634,6 +1868,7 @@ mod tests {
                 word_count: Some(42),
                 error: None,
                 owner_pid: None,
+                retry_count: 0,
             };
             write_job(&job).unwrap();
 
@@ -1674,6 +1909,7 @@ mod tests {
                 word_count: None,
                 error: None,
                 owner_pid: None,
+                retry_count: 0,
             };
             let queued = ProcessingJob {
                 id: "job-queued".into(),
@@ -1699,6 +1935,7 @@ mod tests {
                 word_count: None,
                 error: None,
                 owner_pid: None,
+                retry_count: 0,
             };
 
             write_job(&active).unwrap();
@@ -1739,6 +1976,7 @@ mod tests {
             word_count: None,
             error: None,
             owner_pid: None,
+            retry_count: 0,
         }
     }
 
