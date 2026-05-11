@@ -4866,14 +4866,46 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
     std::fs::create_dir_all(model_dir)?;
 
     let dest = model_dir.join(format!("ggml-{}.bin", model));
-    if dest.exists() {
-        let size = std::fs::metadata(&dest)?.len();
-        eprintln!(
-            "Model already downloaded: {} ({:.0} MB)",
-            dest.display(),
-            size as f64 / 1_048_576.0
-        );
+    let expected_min_bytes = minutes_core::transcribe::expected_whisper_model_size_bytes(model);
+    let mb = |bytes: u64| bytes as f64 / 1_048_576.0;
+
+    // Helper: treat an existing file as truncated if it's smaller than the
+    // expected minimum for this model (issue #229 root cause: a partial
+    // download was reported as "already downloaded" and whisper-rs aborted
+    // parsing the truncated GGML header). Returns Ok(true) when the
+    // existing file should be kept, Ok(false) when it was removed and a
+    // re-download is needed.
+    let keep_existing = if dest.exists() {
+        let actual = std::fs::metadata(&dest)?.len();
+        match expected_min_bytes {
+            Some(min_bytes) if actual < min_bytes => {
+                eprintln!(
+                    "Model file at {} is {:.0} MB but the {} model should be at least {:.0} MB.",
+                    dest.display(),
+                    mb(actual),
+                    model,
+                    mb(min_bytes),
+                );
+                eprintln!(
+                    "Looks truncated, probably an interrupted download. Removing and refetching."
+                );
+                std::fs::remove_file(&dest)?;
+                false
+            }
+            _ => {
+                eprintln!(
+                    "Model already downloaded: {} ({:.0} MB)",
+                    dest.display(),
+                    mb(actual),
+                );
+                true
+            }
+        }
     } else {
+        false
+    };
+
+    if !keep_existing {
         let url = format!(
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{}.bin",
             model
@@ -4881,6 +4913,23 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
 
         eprintln!("Downloading whisper model: {} ...", model);
         download_file(&url, &dest)?;
+
+        // Validate the freshly downloaded file too. A partial download
+        // that ends in a successful HTTP close (rare but possible) would
+        // otherwise slip through silently.
+        if let Some(min_bytes) = expected_min_bytes {
+            let actual = std::fs::metadata(&dest)?.len();
+            if actual < min_bytes {
+                let _ = std::fs::remove_file(&dest);
+                anyhow::bail!(
+                    "downloaded model is {:.0} MB but expected at least {:.0} MB for {}; the file was truncated and has been removed. Try running `minutes setup --model {}` again on a stable connection.",
+                    mb(actual),
+                    mb(min_bytes),
+                    model,
+                    model,
+                );
+            }
+        }
 
         // Update config hint
         eprintln!("\nTo use this model, add to ~/.config/minutes/config.toml:");

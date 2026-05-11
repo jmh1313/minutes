@@ -1402,6 +1402,86 @@ fn denoise_audio(samples: &[f32], sample_rate: u32) -> Vec<f32> {
     denoised
 }
 
+/// Conservative lower bound on the on-disk size of each whisper.cpp ggml
+/// model from `huggingface.co/ggerganov/whisper.cpp`. Used to detect
+/// truncated downloads (issue #229: an interrupted download left a
+/// `ggml-medium.bin` at 221 MB instead of ~1.5 GB; `minutes setup` happily
+/// reported it as "already downloaded" and whisper-rs aborted parsing the
+/// truncated GGML header on the next transcription).
+///
+/// Numbers are set at roughly 90% of the canonical artifact size so a
+/// legitimate file passes comfortably and only a partial download fails
+/// the check. Out of scope here: per-model SHA256 manifests, which would
+/// catch corruption as well as truncation.
+///
+/// Returns `None` for unknown / custom model names; callers should treat
+/// that as "no check available" and skip size validation.
+pub fn expected_whisper_model_size_bytes(model_name: &str) -> Option<u64> {
+    // Real Content-Length values from the canonical URL the CLI downloads
+    // (`huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin`)
+    // as of 2026-05-11:
+    //   tiny      ~74.1 MB
+    //   base     ~141.1 MB
+    //   small    ~465.0 MB
+    //   medium  ~1462.7 MB
+    //   large-v3 ~2951.7 MB
+    // Thresholds sit roughly 5% below those numbers so a real file passes
+    // and only a meaningfully truncated file is rejected.
+    //
+    // Quantized variants (`ggml-medium-q5_0.bin` and friends) have
+    // different sizes and intentionally aren't in this table; the parser
+    // in `validate_whisper_model_size` strips only the canonical
+    // `ggml-{name}.bin` shape, so quantized files resolve to a name like
+    // `medium-q5_0` that hits the `None` arm and skips validation.
+    match model_name {
+        "tiny" | "tiny.en" => Some(70 * 1024 * 1024),
+        "base" | "base.en" => Some(135 * 1024 * 1024),
+        "small" | "small.en" => Some(440 * 1024 * 1024),
+        "medium" | "medium.en" => Some(1_400 * 1024 * 1024),
+        "large-v1" | "large-v2" | "large-v3" | "large" => Some(2_800 * 1024 * 1024),
+        _ => None,
+    }
+}
+
+/// If the resolved path looks like a known `ggml-{name}.bin` artifact,
+/// check its on-disk size against `expected_whisper_model_size_bytes` and
+/// return `Err(ModelTruncated { .. })` if it falls short. Otherwise
+/// returns `Ok(path)` unchanged.
+///
+/// We only validate when the filename matches the canonical pattern so a
+/// user-supplied custom model path (e.g. a fine-tune in a non-standard
+/// location) is never falsely rejected.
+#[cfg(feature = "whisper")]
+fn validate_whisper_model_size(path: PathBuf) -> Result<PathBuf, TranscribeError> {
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(path);
+    };
+    let model_name = match file_name
+        .strip_prefix("ggml-")
+        .and_then(|rest| rest.strip_suffix(".bin"))
+    {
+        Some(name) => name,
+        None => return Ok(path),
+    };
+    let Some(expected_min) = expected_whisper_model_size_bytes(model_name) else {
+        return Ok(path);
+    };
+    let metadata = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return Ok(path),
+    };
+    let actual = metadata.len();
+    if actual >= expected_min {
+        return Ok(path);
+    }
+    Err(TranscribeError::ModelTruncated {
+        path: path.display().to_string(),
+        model_name: model_name.to_string(),
+        actual_mb: actual as f64 / (1024.0 * 1024.0),
+        expected_min_mb: expected_min as f64 / (1024.0 * 1024.0),
+    })
+}
+
 /// Resolve the whisper model file path for dictation (uses dictation.model config).
 #[cfg(feature = "whisper")]
 pub fn resolve_model_path_for_dictation(config: &Config) -> Result<PathBuf, TranscribeError> {
@@ -1416,13 +1496,13 @@ pub fn resolve_model_path_for_dictation(config: &Config) -> Result<PathBuf, Tran
 
     for candidate in &candidates {
         if candidate.exists() {
-            return Ok(candidate.clone());
+            return validate_whisper_model_size(candidate.clone());
         }
     }
 
     let direct = PathBuf::from(model_name);
     if direct.exists() {
-        return Ok(direct);
+        return validate_whisper_model_size(direct);
     }
 
     Err(TranscribeError::ModelNotFound(format!(
@@ -1450,13 +1530,13 @@ pub fn resolve_model_path_by_name(
 
     for candidate in &candidates {
         if candidate.exists() {
-            return Ok(candidate.clone());
+            return validate_whisper_model_size(candidate.clone());
         }
     }
 
     let direct = PathBuf::from(model_name);
     if direct.exists() {
-        return Ok(direct);
+        return validate_whisper_model_size(direct);
     }
 
     // Fall back to dictation model with a warning
@@ -1491,14 +1571,14 @@ fn resolve_model_path(config: &Config) -> Result<PathBuf, TranscribeError> {
 
     for candidate in &candidates {
         if candidate.exists() {
-            return Ok(candidate.clone());
+            return validate_whisper_model_size(candidate.clone());
         }
     }
 
     // If model_name is an absolute path, try it directly
     let direct = PathBuf::from(model_name);
     if direct.exists() {
-        return Ok(direct);
+        return validate_whisper_model_size(direct);
     }
 
     Err(TranscribeError::ModelNotFound(format!(
@@ -2818,6 +2898,76 @@ mod tests {
             "error should include the model directory: {}",
             err
         );
+    }
+
+    #[test]
+    fn expected_whisper_model_sizes_cover_canonical_names() {
+        for name in ["tiny", "base", "small", "medium", "large-v3"] {
+            assert!(
+                expected_whisper_model_size_bytes(name).is_some(),
+                "missing expected size for {}",
+                name
+            );
+        }
+        assert!(expected_whisper_model_size_bytes("nonexistent").is_none());
+        // Sanity: medium must be greater than small (catches regressions
+        // where someone confuses the rows of the size table).
+        assert!(
+            expected_whisper_model_size_bytes("medium").unwrap()
+                > expected_whisper_model_size_bytes("small").unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whisper")]
+    fn validate_whisper_model_size_rejects_truncated_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ggml-medium.bin");
+        // Reproduces issue #229: write a 221 MB file where ~1.5 GB is expected.
+        // We use a smaller stand-in (10 MB) since the validator only cares about
+        // the comparison against `expected_whisper_model_size_bytes("medium")`.
+        let truncated_bytes = 10 * 1024 * 1024;
+        std::fs::write(&path, vec![0u8; truncated_bytes]).unwrap();
+
+        let result = validate_whisper_model_size(path.clone());
+        let err = result.expect_err("a 10 MB ggml-medium.bin should be rejected");
+        match err {
+            TranscribeError::ModelTruncated {
+                model_name,
+                actual_mb,
+                expected_min_mb,
+                ..
+            } => {
+                assert_eq!(model_name, "medium");
+                assert!(actual_mb < expected_min_mb);
+            }
+            other => panic!("expected ModelTruncated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whisper")]
+    fn validate_whisper_model_size_accepts_full_size_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ggml-tiny.bin");
+        // A file at or above the tiny threshold should pass through.
+        let bytes = expected_whisper_model_size_bytes("tiny").unwrap() as usize + 1024;
+        std::fs::write(&path, vec![0u8; bytes]).unwrap();
+        let validated =
+            validate_whisper_model_size(path.clone()).expect("full-size tiny should pass");
+        assert_eq!(validated, path);
+    }
+
+    #[test]
+    #[cfg(feature = "whisper")]
+    fn validate_whisper_model_size_ignores_unknown_filenames() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("custom-finetune.bin");
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        // No `ggml-` prefix means no expected size; the validator must not
+        // reject otherwise legitimate user files in non-standard locations.
+        let validated = validate_whisper_model_size(path.clone()).unwrap();
+        assert_eq!(validated, path);
     }
 
     #[test]

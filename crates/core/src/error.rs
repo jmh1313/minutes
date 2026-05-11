@@ -46,6 +46,22 @@ pub enum TranscribeError {
     #[error("failed to load whisper model: {0}")]
     ModelLoadError(String),
 
+    #[error(
+        "whisper model at {path} looks truncated: file is {actual_mb:.0} MB but the {model_name} model should be at least {expected_min_mb:.0} MB. \
+         A previous download was probably interrupted. Fix: rm \"{path}\" && minutes setup --model {model_name}"
+    )]
+    ModelTruncated {
+        /// Display path of the on-disk model file.
+        path: String,
+        /// Model name as passed to `minutes setup` (e.g. `medium`, `large-v3`).
+        model_name: String,
+        /// Observed size of the file on disk, in MB.
+        actual_mb: f64,
+        /// Conservative lower bound from `expected_whisper_model_size_bytes`,
+        /// in MB. Anything below this is treated as truncated.
+        expected_min_mb: f64,
+    },
+
     #[error("audio file is empty or has zero duration")]
     EmptyAudio,
 
