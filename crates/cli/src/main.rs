@@ -6267,14 +6267,14 @@ life (qmd://life/)
     #[test]
     fn parse_qmd_collection_path_reads_show_output() {
         let output = r#"Collection: minutes
-  Path:     /Users/silverbook/meetings
+  Path:     /Users/you/meetings
   Pattern:  **/*.md
   Include:  yes (default)
 "#;
 
         assert_eq!(
             parse_qmd_collection_path(output),
-            Some(PathBuf::from("/Users/silverbook/meetings"))
+            Some(PathBuf::from("/Users/you/meetings"))
         );
     }
 
