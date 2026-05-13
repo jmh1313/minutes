@@ -5399,7 +5399,9 @@ fn cmd_setup_parakeet(model: &str) -> Result<()> {
     // launched desktop app (different PATH). Spelling the binary out in
     // the config footer prevents the "minutes works in terminal, app
     // says binary-not-found" class of issue.
-    eprintln!("  parakeet_binary = \"<absolute path to parakeet, e.g. /Users/you/.local/bin/parakeet>\"");
+    eprintln!(
+        "  parakeet_binary = \"<absolute path to parakeet, e.g. /Users/you/.local/bin/parakeet>\""
+    );
 
     // Feature-flag visibility check. If this binary was compiled without
     // `--features parakeet`, every config key above is silently inert at
@@ -5419,27 +5421,15 @@ fn cmd_setup_parakeet(model: &str) -> Result<()> {
     // warning fires correctly on a whisper-only binary.
     if !cfg!(feature = "parakeet") {
         eprintln!();
-        eprintln!(
-            "WARNING: this minutes binary was compiled WITHOUT the parakeet feature."
-        );
-        eprintln!(
-            "The model and helper binary above are installed, but the runtime will fall"
-        );
-        eprintln!(
-            "back to whisper regardless of the config keys you just set. To actually use"
-        );
+        eprintln!("WARNING: this minutes binary was compiled WITHOUT the parakeet feature.");
+        eprintln!("The model and helper binary above are installed, but the runtime will fall");
+        eprintln!("back to whisper regardless of the config keys you just set. To actually use");
         eprintln!("parakeet, rebuild the CLI with the feature enabled, e.g.:");
         eprintln!();
-        eprintln!(
-            "  cargo install --path crates/cli --features parakeet --root ~/.cargo --force"
-        );
+        eprintln!("  cargo install --path crates/cli --features parakeet --root ~/.cargo --force");
         eprintln!();
-        eprintln!(
-            "The downloadable DMG and tagged CLI release binaries do include parakeet."
-        );
-        eprintln!(
-            "The Homebrew Formula CLI (`brew install silverstein/tap/minutes`) and bare"
-        );
+        eprintln!("The downloadable DMG and tagged CLI release binaries do include parakeet.");
+        eprintln!("The Homebrew Formula CLI (`brew install silverstein/tap/minutes`) and bare");
         eprintln!("`cargo install minutes-cli` runs are the install paths that omit it.");
     }
 
