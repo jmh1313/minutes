@@ -636,7 +636,12 @@ fn list_archive_jobs() -> Vec<ProcessingJob> {
 /// process restarts; tests get fresh state because each `with_temp_home`
 /// gives them an isolated `~/.minutes/`.
 fn ensure_archive_initialized() {
-    let marker = jobs_dir().join(MIGRATION_MARKER);
+    let root = jobs_dir();
+    if let Err(error) = fs::create_dir_all(&root) {
+        tracing::warn!(error = %error, "failed to initialize jobs directory");
+        return;
+    }
+    let marker = root.join(MIGRATION_MARKER);
     if marker.exists() {
         return;
     }
@@ -2207,6 +2212,23 @@ mod tests {
             assert!(
                 job_path(&later.id).exists(),
                 "post-marker terminal jobs are routed by update_job_state, not by migration"
+            );
+        });
+    }
+
+    #[test]
+    fn ensure_archive_initialized_writes_marker_when_jobs_dir_is_missing() {
+        with_temp_home(|_| {
+            assert!(
+                !jobs_dir().exists(),
+                "fresh installs should start without a jobs directory"
+            );
+
+            ensure_archive_initialized();
+
+            assert!(
+                jobs_dir().join(MIGRATION_MARKER).exists(),
+                "fresh installs should still record a quiet successful migration"
             );
         });
     }

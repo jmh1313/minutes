@@ -1249,6 +1249,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
     // Route whisper.cpp + ggml stderr through the tracing subscriber we just
     // installed. Safe to call multiple times; only the first call has effect.
