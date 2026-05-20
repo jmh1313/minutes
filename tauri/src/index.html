@@ -822,12 +822,16 @@
     .status-pill.processing {
       font-size: 11px;
       padding: 3px 10px;
+      max-width: 96px;
       width: auto;
       height: auto;
       border-radius: 12px;
       opacity: 1;
       background: var(--green-tint);
       color: var(--green);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .status-pill.live {
@@ -6074,6 +6078,20 @@
       }
     }
 
+    function processingPillLabel(job) {
+      switch (job?.state) {
+        case 'queued': return 'queued';
+        case 'transcribing': return 'transcribing';
+        case 'transcript-only': return 'transcript';
+        case 'diarizing': return 'analyzing';
+        case 'summarizing': return 'summary';
+        case 'saving': return 'saving';
+        case 'needs-review': return 'review';
+        case 'failed': return 'failed';
+        default: return 'processing';
+      }
+    }
+
     function renderProcessingJobs(jobs) {
       processingJobs = Array.isArray(jobs) ? jobs : [];
       processingJobsEl.replaceChildren();
@@ -6392,7 +6410,7 @@
           document.getElementById('btn-stop').disabled = false;
           statusPill.className = 'status-pill processing';
           const job = primaryProcessingJob(status);
-          statusPill.textContent = job ? processingStateLabel(job).toLowerCase() : 'processing';
+          statusPill.textContent = processingPillLabel(job);
           processingTitle.textContent = processingStatusTitle(status, mode);
           recordingBar.classList.remove('active');
           processingBar.classList.add('active');
