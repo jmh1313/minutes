@@ -3001,6 +3001,14 @@ fn start_native_call_recording(
                                 completion_notifications_enabled,
                                 &notice,
                             );
+                        } else {
+                            set_recording_error_notice(
+                                latest_output,
+                                "Native call capture failed",
+                                format!(
+                                    "ScreenCaptureKit capture ended early. Recovery queue failed: {queue_error}"
+                                ),
+                            );
                         }
                     }
                 }
@@ -3101,6 +3109,14 @@ fn start_native_call_recording(
                         app_handle,
                         completion_notifications_enabled,
                         &notice,
+                    );
+                } else {
+                    set_recording_error_notice(
+                        latest_output,
+                        "Native call capture failed",
+                        format!(
+                            "Stopping native call capture failed: {error}. Recovery queue failed: {queue_error}"
+                        ),
                     );
                 }
                 reset_hotkey_capture_state(hotkey_runtime, discard_short_hotkey_capture);
@@ -3220,6 +3236,15 @@ fn start_native_call_recording(
                     app_handle,
                     completion_notifications_enabled,
                     &notice,
+                );
+            } else {
+                set_recording_error_notice(
+                    latest_output,
+                    "Processing not started",
+                    format!(
+                        "Failed to queue native call capture for processing: {}",
+                        error
+                    ),
                 );
             }
             starting.store(false, Ordering::Relaxed);
@@ -3457,6 +3482,39 @@ fn set_latest_output(
     if let Ok(mut current) = latest_output.lock() {
         *current = notice;
     }
+}
+
+fn output_error_notice(title: impl Into<String>, detail: impl Into<String>) -> OutputNotice {
+    OutputNotice {
+        kind: "error".into(),
+        title: title.into(),
+        path: String::new(),
+        detail: detail.into(),
+        job_id: None,
+    }
+}
+
+fn recording_start_error_notice(detail: impl Into<String>) -> OutputNotice {
+    output_error_notice("Recording not started", detail)
+}
+
+fn set_recording_start_error(
+    latest_output: &Arc<Mutex<Option<OutputNotice>>>,
+    detail: impl Into<String>,
+) {
+    let detail = detail.into();
+    minutes_core::logging::log_error("desktop_recording_start", "", &detail);
+    set_latest_output(latest_output, Some(recording_start_error_notice(detail)));
+}
+
+fn set_recording_error_notice(
+    latest_output: &Arc<Mutex<Option<OutputNotice>>>,
+    title: impl Into<String>,
+    detail: impl Into<String>,
+) {
+    let detail = detail.into();
+    minutes_core::logging::log_error("desktop_recording", "", &detail);
+    set_latest_output(latest_output, Some(output_error_notice(title, detail)));
 }
 
 fn sync_processing_indicator(
@@ -4779,6 +4837,7 @@ pub fn start_recording(
         Ok(preflight) => preflight,
         Err(error) => {
             eprintln!("Recording preflight failed: {}", error);
+            set_recording_start_error(&latest_output, error.clone());
             show_user_notification(&app_handle, "Recording blocked", &error);
             starting.store(false, Ordering::Relaxed);
             recording.store(false, Ordering::Relaxed);
@@ -4797,6 +4856,7 @@ pub fn start_recording(
     if let Some(reason) = &preflight.blocking_reason {
         if !(preflight.intent == RecordingIntent::Call && native_call_capture_available) {
             eprintln!("Recording preflight blocked: {}", reason);
+            set_recording_start_error(&latest_output, reason.clone());
             show_user_notification(&app_handle, "Recording blocked", reason);
             starting.store(false, Ordering::Relaxed);
             recording.store(false, Ordering::Relaxed);
@@ -4835,7 +4895,16 @@ pub fn start_recording(
             }
             Err(error) => {
                 eprintln!("Native call recording unavailable, falling back: {}", error);
+                minutes_core::logging::log_error(
+                    "desktop_native_call_start",
+                    "",
+                    &format!("native call recording unavailable, falling back: {error}"),
+                );
                 if let Some(reason) = &preflight.blocking_reason {
+                    set_recording_start_error(
+                        &latest_output,
+                        format!("{reason}\n\nNative call capture failed: {error}"),
+                    );
                     show_user_notification(
                         &app_handle,
                         "Recording blocked",
@@ -4858,6 +4927,7 @@ pub fn start_recording(
 
     if let Err(e) = minutes_core::pid::create() {
         eprintln!("Failed to create PID: {}", e);
+        set_recording_start_error(&latest_output, format!("Could not start recording: {}", e));
         show_user_notification(
             &app_handle,
             "Recording",
@@ -5021,6 +5091,11 @@ pub fn start_recording(
                             );
                         } else {
                             eprintln!("Queue error: {}", e);
+                            set_recording_error_notice(
+                                &latest_output,
+                                "Processing not started",
+                                format!("Recording finished, but queueing processing failed: {e}"),
+                            );
                         }
                     }
                 }
@@ -5073,6 +5148,11 @@ pub fn start_recording(
                 );
             } else {
                 eprintln!("Capture error: {}", e);
+                set_recording_error_notice(
+                    &latest_output,
+                    "Recording failed",
+                    format!("Recording failed before processing: {e}"),
+                );
             }
         }
     }
@@ -5475,6 +5555,19 @@ pub fn cmd_start_recording(
     } else {
         requested_intent
     };
+    minutes_core::logging::log_step(
+        "desktop_recording_start",
+        "",
+        0,
+        serde_json::json!({
+            "action": "requested",
+            "mode": format!("{capture_mode:?}"),
+            "intent": requested_intent.map(|intent| format!("{intent:?}")),
+            "source": source,
+            "recording_active": recording_active(&state.recording),
+            "starting": state.starting.load(Ordering::Relaxed),
+        }),
+    );
 
     // Early-out BEFORE mutating any call-detect session atomics: if another
     // recording is already in flight, launch_recording will reject this call
@@ -5484,7 +5577,9 @@ pub fn cmd_start_recording(
     // athal7 hit in issue #129: the auto-stop countdown got silently killed
     // mid-call by a start request that never actually became a recording.
     if recording_active(&state.recording) || state.starting.load(Ordering::Relaxed) {
-        return Err("Already recording".into());
+        let error = "Already recording";
+        set_recording_start_error(&state.latest_output, error);
+        return Err(error.into());
     }
 
     // Session-level flag that scopes the stop_when_call_ends auto-stop only
@@ -5497,7 +5592,7 @@ pub fn cmd_start_recording(
     // the UI doesn't auto-stop a session the user has already moved past.
     reset_call_end_countdown(&state);
 
-    launch_recording(
+    match launch_recording(
         app,
         &state,
         capture_mode,
@@ -5507,7 +5602,13 @@ pub fn cmd_start_recording(
         language,
         None,
         None,
-    )
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            set_recording_start_error(&state.latest_output, error.clone());
+            Err(error)
+        }
+    }
 }
 
 /// Reset countdown lifecycle state for a fresh recording/session boundary.
@@ -5587,6 +5688,7 @@ pub fn cmd_mic_mute_state() -> bool {
 
 fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value {
     let recording = state.recording.load(Ordering::Relaxed);
+    let starting = state.starting.load(Ordering::Relaxed);
     let shared_processing = minutes_core::pid::read_processing_status();
     // Scan ~/.minutes/jobs/ once per status call — `pid::status_with_active_jobs`
     // reuses this snapshot instead of triggering two more directory walks
@@ -5666,6 +5768,7 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
 
     let mut value = serde_json::json!({
         "recording": recording || (status.recording && !processing),
+        "starting": starting,
         "processing": processing,
         "recordingMode": status.recording_mode,
         "processingStage": processing_stage,
@@ -8243,6 +8346,7 @@ mod tests {
 
             for key in [
                 "recording",
+                "starting",
                 "processing",
                 "recordingMode",
                 "processingStage",
@@ -9787,6 +9891,16 @@ mod tests {
 
         set_call_detection_sentinel(&mut config, "google-meet", false);
         assert!(!call_detection_has_sentinel(&config, "google-meet"));
+    }
+
+    #[test]
+    fn recording_start_error_notice_has_no_openable_path() {
+        let notice = recording_start_error_notice("ScreenCaptureKit tap unavailable");
+
+        assert_eq!(notice.kind, "error");
+        assert_eq!(notice.title, "Recording not started");
+        assert_eq!(notice.path, "");
+        assert_eq!(notice.detail, "ScreenCaptureKit tap unavailable");
     }
 
     #[test]
