@@ -139,7 +139,7 @@ Supported basis values are `verbal_all_parties`, `notice_in_invite`,
 ```toml
 [consent]
 mode = "remind"
-disclosure_script = "Heads up — I'm using Minutes to transcribe this conversation locally on my device for my own notes. Let me know if you'd prefer I didn't."
+disclosure_script = "Heads up: I'm using Minutes to transcribe this conversation locally on my device for my own notes. Let me know if you'd prefer I didn't."
 # default_basis = "notice_in_invite"
 ```
 
@@ -149,6 +149,23 @@ CLI flags override the config for a single recording:
 minutes record --consent verbal_all_parties
 minutes record --consent notice_in_invite --consent-notice "Notice was included in the calendar invite."
 ```
+
+### Sensitive meeting frontmatter
+
+`minutes sensitive start` opens a no-capture meeting session for typed markers.
+`minutes sensitive stop` writes a regular markdown meeting artifact, but marks
+the capture and sensitivity policy explicitly:
+
+```yaml
+capture: none
+sensitivity: restricted
+consent: na
+debrief: pending
+```
+
+`debrief: pending` is present only when the session is saved without any typed
+debrief content. Non-interactive callers never wait for prompts; they save the
+artifact immediately and leave the debrief status for a later assistant pass.
 
 ### `[retention]` — raw audio policy
 

@@ -43,6 +43,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use serde::Deserialize;
+use tauri::Manager;
 use tauri::{AppHandle, Emitter, State};
 
 use minutes_core::palette::recents::RecentsStore;
@@ -51,9 +52,10 @@ use minutes_core::Config;
 
 use crate::commands::{
     cmd_add_note, cmd_create_artifact_from_meeting, cmd_open_meeting_url, cmd_search,
-    cmd_start_dictation, cmd_start_live_transcript, cmd_start_recording, cmd_stop_dictation,
-    cmd_stop_live_transcript, cmd_stop_recording, cmd_upcoming_meetings, copy_to_clipboard,
-    dictation_pid_active, open_target, recording_active, AppState,
+    cmd_sensitive_start, cmd_sensitive_stop, cmd_start_dictation, cmd_start_live_transcript,
+    cmd_start_recording, cmd_stop_dictation, cmd_stop_live_transcript, cmd_stop_recording,
+    cmd_upcoming_meetings, copy_to_clipboard, dictation_pid_active, open_target, recording_active,
+    AppState,
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -234,6 +236,9 @@ pub(crate) fn backend_flags(state: &AppState) -> StateFlags {
     let dict_in_app = state.dictation_active.load(Ordering::Relaxed);
     if dict_in_app || dictation_pid_active() {
         f = f.union(StateFlags::DICTATION);
+    }
+    if minutes_core::sensitive::is_active() {
+        f = f.union(StateFlags::SENSITIVE);
     }
 
     f
@@ -449,8 +454,25 @@ fn dispatch_action(
             }
             // Palette launches with pipeline defaults — users who need flags
             // reach for the CLI or the existing tray menu.
-            cmd_start_recording(app, state, None, None, None, None, None, None)?;
-            Ok(ActionResponse::Ok)
+            match cmd_start_recording(app.clone(), state, None, None, None, None, None, None, None)?
+            {
+                crate::commands::StartRecordingOutcome::Started => Ok(ActionResponse::Ok),
+                crate::commands::StartRecordingOutcome::ConsentRequired { disclosure } => {
+                    // Require mode: route the palette start to the same
+                    // blocking modal as the in-window button instead of
+                    // silently reporting success with no recording
+                    // (spec Part A; review F1).
+                    if let Some(window) = app.get_webview_window("main") {
+                        window.show().ok();
+                        window.set_focus().ok();
+                    }
+                    let _ = app.emit(
+                        "minutes://recording-consent-required",
+                        serde_json::json!({ "disclosure": disclosure }),
+                    );
+                    Ok(ActionResponse::Ok)
+                }
+            }
         }
         ActionId::StopRecording => {
             cmd_stop_recording(state)?;
@@ -481,6 +503,14 @@ fn dispatch_action(
             let lines = serde_json::to_value(&lines)
                 .map_err(|e| format!("serialize live transcript: {}", e))?;
             Ok(ActionResponse::LiveLines { lines })
+        }
+        ActionId::StartSensitiveMeeting => {
+            cmd_sensitive_start(None)?;
+            Ok(ActionResponse::Ok)
+        }
+        ActionId::StopSensitiveMeeting => {
+            cmd_sensitive_stop(app, state)?;
+            Ok(ActionResponse::Ok)
         }
 
         // ── Dictation ────────────────────────────────────────────
