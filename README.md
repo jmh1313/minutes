@@ -43,6 +43,10 @@ brew install --cask silverstein/tap/minutes
 # macOS — CLI only
 brew tap silverstein/tap && brew install minutes
 
+# Newer Homebrew versions distrust third-party taps by default; if brew warns
+# "Skipping silverstein/tap because it is not trusted", run once:
+brew trust silverstein/tap
+
 # Any platform — from source (requires Rust + cmake; Windows also needs LLVM)
 cargo install minutes-cli                          # macOS/Linux
 cargo install minutes-cli --no-default-features    # Windows (see install notes below)
