@@ -563,6 +563,110 @@
       transition: opacity 200ms ease;
     }
 
+    /* ── Recall native chat panel (dev-mode OFF) ── */
+    .recall-chat-container {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .chat-bubble {
+      font-family: 'Geist Mono', 'SF Mono', Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      max-width: 88%;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .chat-bubble-user {
+      align-self: flex-end;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      color: var(--fg);
+    }
+
+    .chat-bubble-assistant {
+      align-self: flex-start;
+      color: var(--fg);
+      padding: 2px 0;
+    }
+
+    /* Streaming caret — only once text is arriving, so an empty bubble doesn't
+       read as a stray cursor. */
+    .chat-bubble-assistant.streaming:not(:empty)::after {
+      content: '\25ae';
+      margin-left: 2px;
+      animation: recall-blink 1s step-end infinite;
+    }
+
+    /* Pre-first-token grounding state: an empty streaming bubble narrates what
+       the agent is doing via data-status — "thinking", then live MCP tool
+       labels ("searching your meetings", "checking commitments") — with pulsing
+       dots, so a slow agent cold-start reads as working, not frozen (#404). It
+       vanishes the moment streamed text lands (the bubble is no longer :empty).
+       data-status unset falls back to just the dots. */
+    .chat-bubble-assistant.streaming:empty::before {
+      content: attr(data-status) '\2009\2022\2009\2022\2009\2022';
+      color: var(--fg);
+      animation: recall-thinking 1.4s ease-in-out infinite;
+    }
+
+    @keyframes recall-blink {
+      50% { opacity: 0; }
+    }
+
+    @keyframes recall-thinking {
+      0%, 100% { opacity: 0.3; }
+      50% { opacity: 0.85; }
+    }
+
+    .chat-input-row {
+      display: flex;
+      gap: 8px;
+      padding: 10px 12px;
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .chat-input-row textarea {
+      flex: 1;
+      resize: none;
+      font-family: 'Geist Mono', 'SF Mono', Menlo, monospace;
+      font-size: 12px;
+      padding: 6px 10px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--fg);
+      outline: none;
+      line-height: 1.4;
+    }
+
+    .chat-input-row textarea:focus {
+      border-color: var(--border-mid);
+    }
+
+    .chat-input-row textarea::placeholder {
+      opacity: 0.5;
+    }
+
+    .chat-input-row .btn {
+      align-self: flex-end;
+    }
+
     /* Quick note inside recall panel during recording */
     .recall-note {
       display: none;
@@ -573,6 +677,33 @@
 
     .recall-note.active {
       display: block;
+    }
+
+    /* ── Recall mode toggle button (dev-mode switch in panel header) ── */
+    .recall-mode-toggle {
+      padding: 2px 6px;
+      border-radius: 6px;
+      border: none;
+      background: transparent;
+      color: var(--text-tertiary);
+      font-size: 12px;
+      cursor: pointer;
+      line-height: 1;
+    }
+
+    .recall-mode-toggle:hover {
+      color: var(--text-secondary);
+      background: var(--bg-hover);
+    }
+
+    .recall-mode-toggle:focus-visible {
+      outline: none;
+      color: var(--text-secondary);
+      background: var(--bg-hover);
+    }
+
+    .recall-mode-toggle.active {
+      color: var(--text-secondary);
     }
 
     .recall-note-row {
@@ -5026,6 +5157,7 @@
       <div class="recall-header-actions">
         <button class="btn btn-secondary btn-sm" id="btn-recall-weekly">Weekly</button>
         <button class="btn btn-secondary btn-sm recall-end-btn" id="btn-recall-end">End Session</button>
+        <button class="recall-mode-toggle" id="btn-recall-mode-toggle" title="Switch to terminal (developer mode)">⌨</button>
         <button class="recall-close" id="btn-recall-close" title="Close panel">&times;</button>
       </div>
     </div>
@@ -5043,6 +5175,14 @@
       <pre id="recall-weekly-content">Loading weekly summary…</pre>
     </div>
     <div class="recall-terminal hidden" id="recall-terminal-container"></div>
+    <!-- Recall native chat panel — shown when developer mode is OFF -->
+    <div class="recall-chat-container" id="recall-chat-panel" style="display:none;">
+      <div class="chat-messages" id="recall-chat-messages"></div>
+      <div class="chat-input-row">
+        <textarea id="recall-chat-input" placeholder="Ask about this meeting…" rows="2"></textarea>
+        <button class="btn btn-secondary btn-sm" id="recall-chat-send">Send</button>
+      </div>
+    </div>
     <div class="recall-exit-banner" id="recall-exit-banner">
       Session ended.
       <button class="btn btn-secondary btn-sm" id="btn-recall-restart">Restart</button>
@@ -5912,6 +6052,11 @@
             <div class="about-controls-meta" id="settings-agent-args-help"></div>
           </div>
         </div>
+        <div class="about-controls">
+          <div class="about-controls-copy">Developer mode (terminal)</div>
+          <button class="btn btn-secondary btn-sm toggle-btn" id="settings-recall-dev-mode">Off</button>
+        </div>
+        <div class="about-controls-meta settings-compact-meta">Off: native chat bubbles — On: embedded terminal for power users</div>
       </div>
 
       </div><!-- /panel-ai -->
@@ -9599,6 +9744,8 @@
             : 'The agent will ask before running tools like file edits and shell commands.';
           updateAssistantAgentUi(s.assistant.agent, extraArgs);
         } catch (e) { console.error('agent flags:', e); }
+        // Recall developer mode toggle (localStorage-only, not in config)
+        setSettingsToggle('settings-recall-dev-mode', recallDevMode);
         // Call detection settings
         if (s.call_detection) {
           setSettingsToggle('settings-call-detection', s.call_detection.enabled);
@@ -10396,6 +10543,49 @@
       await saveAgentArgs();
     });
     document.getElementById('settings-agent-args').addEventListener('change', () => saveAgentArgs());
+
+    document.getElementById('settings-recall-dev-mode').addEventListener('click', () => {
+      const btn = document.getElementById('settings-recall-dev-mode');
+      const next = btn.textContent.trim() !== 'On';
+      recallDevMode = next;
+      localStorage.setItem('minutes.recallDevMode', String(next));
+      setSettingsToggle('settings-recall-dev-mode', next);
+      // Sync the in-panel mode toggle button state.
+      const modeToggleBtn = document.getElementById('btn-recall-mode-toggle');
+      if (modeToggleBtn) {
+        modeToggleBtn.classList.toggle('active', next);
+        modeToggleBtn.title = next
+          ? 'Switch to chat (native mode)'
+          : 'Switch to terminal (developer mode)';
+      }
+      // Apply the new mode immediately if the panel is currently open.
+      if (recallExpanded) applyRecallMode();
+    });
+
+    // ── In-panel mode toggle (developer mode shortcut in recall header) ──
+    // NOTE: recallDevMode (let) is declared later in the recall section.
+    // Read localStorage directly here to avoid a Temporal Dead Zone crash.
+    const recallModeToggleBtn = document.getElementById('btn-recall-mode-toggle');
+    if (recallModeToggleBtn) {
+      const _initDevMode = localStorage.getItem('minutes.recallDevMode') === 'true';
+      recallModeToggleBtn.classList.toggle('active', _initDevMode);
+      if (_initDevMode) {
+        recallModeToggleBtn.title = 'Switch to chat (native mode)';
+      }
+      recallModeToggleBtn.addEventListener('click', () => {
+        recallDevMode = !recallDevMode;
+        localStorage.setItem('minutes.recallDevMode', String(recallDevMode));
+        // Sync the Settings toggle.
+        setSettingsToggle('settings-recall-dev-mode', recallDevMode);
+        // Update button appearance.
+        recallModeToggleBtn.classList.toggle('active', recallDevMode);
+        recallModeToggleBtn.title = recallDevMode
+          ? 'Switch to chat (native mode)'
+          : 'Switch to terminal (developer mode)';
+        // Apply the new mode immediately if the panel is currently open.
+        if (recallExpanded) applyRecallMode();
+      });
+    }
 
     // Call detection settings handlers
     document.getElementById('settings-call-detection').addEventListener('click', async () => {
@@ -11265,6 +11455,22 @@
     let recallThemeHandler = null;
     let expandAnimating = false;
 
+    // ── Recall native chat state ──
+    // Persisted in localStorage so it survives app restarts.
+    let recallDevMode = localStorage.getItem('minutes.recallDevMode') === 'true';
+    const recallChatPanel = document.getElementById('recall-chat-panel');
+    const recallChatMessages = document.getElementById('recall-chat-messages');
+    const recallChatInput = document.getElementById('recall-chat-input');
+    const recallChatSendBtn = document.getElementById('recall-chat-send');
+    let currentAssistantBubble = null;
+    let chatListenersRegistered = false;
+    // Tracks which meeting the *currently displayed* native chat conversation
+    // belongs to. Deliberately separate from currentMeetingPath: other flows
+    // (e.g. closeDetailView()) null out currentMeetingPath transiently before
+    // openRecall() re-sets it, which would cause a false "meeting changed"
+    // read if we compared against currentMeetingPath directly.
+    let recallChatMeetingPath = null;
+
     function applySidebarCollapsed(collapsed, { explicit = false } = {}) {
       // Pin the collapsed (fixed-position) chevron to the exact spot the button
       // occupies while expanded, so collapsing only rotates it — no vertical
@@ -11397,7 +11603,17 @@
       if (phase === 'weekly') {
         recallLoading.classList.remove('active');
       }
-      recallTerminalContainer.classList.toggle('hidden', phase === 'weekly');
+      // Keep the (flex:1) terminal container hidden whenever it isn't the active
+      // surface: in weekly view, and — critically — in native chat mode. Without
+      // the `!recallDevMode` guard a recording/restore phase change unhid the
+      // empty terminal, which then split the panel's vertical space 50/50 with
+      // the chat container and pushed the welcome/messages into the middle
+      // (looked "vertically centered" instead of top-anchored).
+      recallTerminalContainer.classList.toggle('hidden', phase === 'weekly' || !recallDevMode);
+      // Hide chat panel in weekly view regardless of mode; restore it when leaving.
+      if (recallChatPanel) {
+        recallChatPanel.style.display = (phase === 'weekly' || recallDevMode) ? 'none' : 'flex';
+      }
       recallNote.classList.toggle('active', phase === 'listening');
       persistRecallWorkspaceState({ recallPhase: phase });
     }
@@ -11489,6 +11705,13 @@
           bytes[i] = raw.charCodeAt(i);
         }
         recallTerminal.write(bytes);
+        // The PTY session keeps running in the background after switching to
+        // chat mode (so its context survives a later switch back), so it can
+        // keep emitting data while chat is the active view. Only reveal the
+        // terminal container for that data if terminal mode is actually the
+        // current view — otherwise this unconditionally re-showed the
+        // terminal on top of/alongside the chat panel ("split view").
+        if (!recallDevMode) return;
         const wasHidden = recallTerminalContainer.classList.contains('hidden');
         recallLoading.classList.remove('active');
         recallTerminalContainer.classList.remove('hidden');
@@ -11502,6 +11725,233 @@
         recallPtyAlive = false;
         recallExitBanner.classList.add('active');
         recallEndBtn.classList.remove('active');
+      });
+    }
+
+    // ── Recall native chat (dev-mode OFF) ──
+
+    /// Insert a one-time welcome bubble when the chat panel is first shown.
+    function showChatWelcome() {
+      if (!recallChatMessages || recallChatMessages.children.length > 0) return;
+      const bubble = document.createElement('div');
+      bubble.className = 'chat-bubble chat-bubble-assistant';
+      bubble.textContent = 'Ask me about this meeting — action items, decisions, key moments from the transcript. I have access to your meeting workspace.';
+      recallChatMessages.appendChild(bubble);
+    }
+
+    /// Reset native chat state when focus switches to a different meeting.
+    ///
+    /// Clears the visible chat bubbles and the backend's turn history so the
+    /// new meeting starts with a clean conversation instead of inheriting
+    /// stale context from whatever meeting was previously focused. Callers
+    /// are responsible for confirming the meeting actually changed before
+    /// calling this — it unconditionally wipes the current conversation.
+    async function resetRecallChat() {
+      if (recallChatMessages) recallChatMessages.replaceChildren();
+      currentAssistantBubble = null;
+      try {
+        await invoke('cmd_recall_chat_clear');
+      } catch (e) {
+        console.error('cmd_recall_chat_clear failed:', e);
+      }
+      showChatWelcome();
+    }
+
+    /// Apply the current mode to the recall panel contents.
+    ///
+    /// Symmetric in both directions so switching mode *after* the panel is
+    /// already open behaves exactly like opening in that mode:
+    ///  - dev/terminal: hide chat, reveal + init the terminal, ensure a PTY.
+    ///  - chat/native: hide the terminal, register chat listeners, show chat.
+    ///
+    /// Previously the dev branch only hid the chat panel and never spun up a
+    /// PTY, so toggling to terminal mode mid-session showed a black pane.
+    async function applyRecallMode() {
+      if (recallDevMode) {
+        // Terminal (developer) mode — mirror openRecall()'s dev path.
+        // cmd_spawn_terminal is idempotent: if the assistant session already
+        // exists the backend no-ops, so chat→terminal→chat→terminal never
+        // double-spawns. A PTY started earlier is left running when we switch
+        // away to chat, so re-entering terminal mode just re-reveals it.
+        if (recallChatPanel) recallChatPanel.style.display = 'none';
+        recallTerminalContainer.classList.remove('hidden');
+        initRecallTerminal();
+        await registerPtyListeners();
+        if (!recallPtyAlive) {
+          try {
+            await invoke('cmd_spawn_terminal', { mode: 'assistant' });
+            recallPtyAlive = true;
+            recallEndBtn.classList.add('active');
+          } catch (e) {
+            const msg = typeof e === 'string' ? e : String(e);
+            if (msg.includes('already running') || msg.includes('Already')) {
+              recallPtyAlive = true;
+              recallEndBtn.classList.add('active');
+            } else {
+              console.error('Recall terminal spawn:', e);
+            }
+          }
+        }
+        recallLoading.classList.remove('active');
+        // Re-fit once the container is actually visible so xterm measures the
+        // real width; focus for immediate typing.
+        setTimeout(() => {
+          if (recallFitAddon) recallFitAddon.fit();
+          if (recallTerminal) recallTerminal.focus();
+        }, 60);
+      } else {
+        // Chat (native) mode. Leave any PTY session running in the background
+        // so switching back preserves the agent's context — End Session is the
+        // explicit teardown. Any in-flight chat request completes harmlessly.
+        recallTerminalContainer.classList.add('hidden');
+        await registerChatListeners();
+        if (recallChatPanel) {
+          recallChatPanel.style.display = 'flex';
+          showChatWelcome();
+        }
+        recallLoading.classList.remove('active');
+      }
+    }
+
+    // #404: friendly status labels for the read-only Minutes MCP tools the
+    // Recall chat can call, so the pre-answer grounding phase narrates what the
+    // agent is actually doing ("searching your meetings") instead of dead air.
+    const RECALL_TOOL_STATUS = {
+      search_meetings: 'searching your meetings',
+      list_meetings: 'browsing your meetings',
+      get_meeting: 'reading a meeting',
+      research_topic: 'researching a topic',
+      get_person_profile: 'looking up a person',
+      relationship_map: 'mapping relationships',
+      track_commitments: 'checking commitments',
+      get_meeting_insights: 'pulling out insights',
+      consistency_report: 'checking for conflicts',
+      get_agent_annotations: 'reading annotations',
+      read_live_transcript: 'reading the live transcript',
+      activity_summary: 'reviewing recent activity',
+      search_context: 'searching desktop context',
+      get_moment: 'looking up a moment',
+      list_processing_jobs: 'checking processing status',
+      get_status: 'checking status',
+      list_voices: 'checking voices',
+      knowledge_status: 'checking your knowledge base',
+      qmd_collection_status: 'checking your collections',
+    };
+
+    // Update the empty-bubble status label from a claude stream-json chunk's
+    // tool_use blocks. Only while the answer text hasn't started (:empty), so
+    // the narration never overwrites a streaming reply.
+    function updateRecallChatStatus(chunk) {
+      if (!currentAssistantBubble || currentAssistantBubble.textContent.trim()) return;
+      if (!chunk || chunk.type !== 'assistant' || !chunk.message || !chunk.message.content) return;
+      for (const part of chunk.message.content) {
+        if (part && part.type === 'tool_use') {
+          const tool = String(part.name || '').replace(/^mcp__[^_]+__/, '');
+          currentAssistantBubble.dataset.status = RECALL_TOOL_STATUS[tool] || 'consulting your memory';
+        }
+      }
+    }
+
+    /// Register one-time Tauri event listeners for recall-chat-chunk and recall-chat-done.
+    async function registerChatListeners() {
+      if (chatListenersRegistered) return;
+      chatListenersRegistered = true;
+
+      await currentWindow.listen('recall-chat-chunk', (event) => {
+        const chunk = event.payload;
+        updateRecallChatStatus(chunk);
+        let text = '';
+        if (chunk && chunk.type === 'assistant' && chunk.message && chunk.message.content) {
+          // Streaming assistant turn: { type:"assistant", message:{ content:[{type:"text",text:"..."}] } }
+          for (const part of chunk.message.content) {
+            if (part.type === 'text') text += part.text;
+          }
+        } else if (chunk && chunk.type === 'result' && typeof chunk.result === 'string') {
+          // Final result event — use as fallback if the assistant bubble is still empty.
+          if (currentAssistantBubble && !currentAssistantBubble.textContent.trim()) {
+            text = chunk.result;
+          }
+          if (chunk.subtype !== 'success' && currentAssistantBubble && !currentAssistantBubble.textContent.trim()) {
+            text = chunk.error || chunk.result || 'Claude returned an error.';
+          }
+        }
+        if (text && currentAssistantBubble) {
+          currentAssistantBubble.textContent += text;
+          if (recallChatMessages) recallChatMessages.scrollTop = recallChatMessages.scrollHeight;
+        }
+      });
+
+      await currentWindow.listen('recall-chat-error', (event) => {
+        // stderr from the claude process — shown only when the bubble is still empty.
+        const stderr = String(event.payload || '');
+        if (stderr && currentAssistantBubble && !currentAssistantBubble.textContent.trim()) {
+          currentAssistantBubble.classList.remove('streaming');
+          currentAssistantBubble.textContent = stderr;
+        }
+      });
+
+      await currentWindow.listen('recall-chat-done', () => {
+        if (currentAssistantBubble) {
+          currentAssistantBubble.classList.remove('streaming');
+          currentAssistantBubble = null;
+        }
+        if (recallChatSendBtn) recallChatSendBtn.disabled = false;
+        if (recallChatInput) {
+          recallChatInput.disabled = false;
+          recallChatInput.focus();
+        }
+      });
+    }
+
+    async function sendRecallChat() {
+      if (!recallChatInput || !recallChatMessages) return;
+      const text = recallChatInput.value.trim();
+      if (!text) return;
+
+      // Append user bubble
+      const userBubble = document.createElement('div');
+      userBubble.className = 'chat-bubble chat-bubble-user';
+      userBubble.textContent = text;
+      recallChatMessages.appendChild(userBubble);
+
+      // Append empty assistant bubble (filled by streaming chunks). data-status
+      // drives the pre-answer grounding narration (#404); it starts at
+      // "thinking" and updateRecallChatStatus swaps in live MCP tool labels.
+      currentAssistantBubble = document.createElement('div');
+      currentAssistantBubble.className = 'chat-bubble chat-bubble-assistant streaming';
+      currentAssistantBubble.dataset.status = 'thinking';
+      recallChatMessages.appendChild(currentAssistantBubble);
+      recallChatMessages.scrollTop = recallChatMessages.scrollHeight;
+
+      recallChatInput.value = '';
+      recallChatInput.disabled = true;
+      if (recallChatSendBtn) recallChatSendBtn.disabled = true;
+
+      try {
+        await invoke('cmd_recall_chat_send', { message: text });
+      } catch (e) {
+        if (currentAssistantBubble) {
+          currentAssistantBubble.classList.remove('streaming');
+          const errMsg = String(e);
+          currentAssistantBubble.textContent = errMsg.includes('claude not found')
+            ? 'Claude Code not found. Install it with: npm install -g @anthropic-ai/claude-code'
+            : 'Error: ' + errMsg;
+          currentAssistantBubble = null;
+        }
+        if (recallChatSendBtn) recallChatSendBtn.disabled = false;
+        if (recallChatInput) recallChatInput.disabled = false;
+      }
+    }
+
+    if (recallChatSendBtn) {
+      recallChatSendBtn.addEventListener('click', sendRecallChat);
+    }
+    if (recallChatInput) {
+      recallChatInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          sendRecallChat();
+        }
       });
     }
 
@@ -11551,13 +12001,17 @@
       localStorage.setItem('minutes.recallExpanded', 'true');
       persistRecallWorkspaceState({ recallExpanded: true });
 
-      initRecallTerminal();
-      await registerPtyListeners();
-
-      setTimeout(() => {
-        if (recallFitAddon) recallFitAddon.fit();
-        if (recallTerminal) recallTerminal.focus();
-      }, 260);
+      if (recallDevMode) {
+        initRecallTerminal();
+        await registerPtyListeners();
+        setTimeout(() => {
+          if (recallFitAddon) recallFitAddon.fit();
+          if (recallTerminal) recallTerminal.focus();
+        }, 260);
+      } else {
+        applyRecallMode();
+        await registerChatListeners();
+      }
     }
 
     async function collapseRecallPanel() {
@@ -11598,6 +12052,36 @@
 
       await expandRecallPanel();
 
+      if (!recallDevMode) {
+        // Native chat mode: apply layout and register listeners.
+        // expandRecallPanel already called applyRecallMode() + registerChatListeners()
+        // but handle the case where the panel was already expanded (bailed early).
+        // Unlike the terminal branch below, this path never forwarded
+        // meetingPath anywhere, so the backend chat handler had no way to
+        // know which meeting was focused ("Discuss with Agent" opened the
+        // chat but cmd_recall_chat_send saw no current_meeting_path).
+        if (meetingPath) {
+          // Only reset the conversation when switching to a *different*
+          // meeting. Re-focusing the same meeting (closing/reopening the
+          // panel, clicking "Discuss with Agent" again) must preserve the
+          // ongoing chat. Compare against recallChatMeetingPath rather than
+          // currentMeetingPath — some callers (closeDetailView) null out
+          // currentMeetingPath transiently right before invoking openRecall,
+          // which would otherwise look like a meeting switch every time.
+          const switchedMeeting = meetingPath !== recallChatMeetingPath;
+          currentMeetingPath = meetingPath;
+          recallChatMeetingPath = meetingPath;
+          persistRecallWorkspaceState({ currentMeetingPath: meetingPath });
+          if (switchedMeeting) {
+            await resetRecallChat();
+          }
+        }
+        applyRecallMode();
+        await registerChatListeners();
+        return;
+      }
+
+      // Developer (terminal) mode \u2014 original PTY path.
       // If the panel was already expanded, expandRecallPanel bailed out
       // and skipped initRecallTerminal. Ensure it's initialized.
       initRecallTerminal();
@@ -12844,7 +13328,9 @@
       }
       recallPtyAlive = true;
       recallLoading.classList.remove('active');
-      recallTerminalContainer.classList.remove('hidden');
+      // Only reveal the terminal when it's the active surface (dev mode); in
+      // chat mode it must stay hidden so it doesn't steal the panel's height.
+      if (recallDevMode) recallTerminalContainer.classList.remove('hidden');
       recallEndBtn.classList.add('active');
     });
 
@@ -12865,7 +13351,12 @@
     // ── Button handlers ──
     assistantBtn.addEventListener('click', () => toggleRecallPanel());
     recallWeeklyBtn.addEventListener('click', () => {
-      openWeeklyPhase();
+      if (recallPhase === 'weekly') {
+        setRecallPhase('recall');
+        applyRecallMode();
+      } else {
+        openWeeklyPhase();
+      }
     });
 
     document.getElementById('btn-recall-close').addEventListener('click', () => {

@@ -89,6 +89,11 @@ pub struct AppState {
     /// from the cancel bit so the detector can tell an explicit user cancel
     /// from an internal reset or teardown path.
     pub call_end_countdown_terminal_state: Arc<AtomicU8>,
+    /// Conversation history for the native Recall chat panel.
+    /// Each entry is `(user_message, assistant_response)`. Cleared via
+    /// `cmd_recall_chat_clear`. Capped to the last 6 turns in the prompt
+    /// to keep token usage bounded.
+    pub recall_chat_history: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -8524,6 +8529,623 @@ pub fn spawn_terminal(
     Ok((crate::pty::ASSISTANT_SESSION_ID.into(), title))
 }
 
+// ── Recall native chat ────────────────────────────────────────
+
+/// Written to `chat_cwd/CLAUDE.md` on every `cmd_recall_chat_send` call so
+/// claude auto-loads it from cwd at process start (see `build_chat_invocation`
+/// in `minutes_core::summarize` for the matching `--allowedTools` scope this
+/// describes). Deliberately honest about the constraints of a single-shot,
+/// non-interactive process instead of pretending to be a full agentic
+/// session — see PR #404 review discussion: a chat-scoped CLAUDE.md that's
+/// honest about the non-interactive context is a better foundation than a
+/// hard `--tools ""` lockout, and leaves room to grow the allow-list later.
+const CHAT_WORKSPACE_CLAUDE_MD: &str = "\
+# Minutes — Recall chat (single-shot session)
+
+You are answering one message inside the Minutes app's Recall chat panel, not running an interactive \
+agent loop. Each message is a fresh, non-interactive `claude -p` process — there is no persistent \
+session, no shell, and no file write access of any kind. There is nobody watching this session to \
+approve a permission prompt, so an unlisted tool call is rejected immediately rather than pausing to ask.
+
+## What's already in front of you
+
+The current user message below already includes: the currently focused meeting's content (if any), \
+up to 5 keyword-matched excerpts from other meetings, and the last few turns of this conversation. \
+Read that first — it answers most questions without any tool call.
+
+## Tools you do have (read-only, pre-approved)
+
+A small allow-list of the Minutes MCP server's read-only tools is available for lookups the inline \
+context doesn't cover:
+
+- `search_meetings`, `get_meeting`, `list_meetings`, `research_topic` — find and read past meetings/memos
+- `get_person_profile`, `relationship_map`, `track_commitments` — relationship and commitment memory
+- `get_meeting_insights`, `consistency_report`, `get_agent_annotations` — structured decisions/insights
+- `list_processing_jobs`, `get_status`, `list_voices`, `knowledge_status`, `qmd_collection_status` — status/inventory checks
+- `read_live_transcript` — read an in-progress recording or live-transcript session
+- `activity_summary`, `search_context`, `get_moment` — desktop-context lookups (app focus, window titles)
+
+Prefer these over guessing when the inline context is missing something concrete and answerable.
+
+## What you don't have
+
+No shell, no file access, no writes of any kind — no starting/stopping recordings or dictation, no \
+adding notes or agent annotations, no confirming speakers, no changing config, no opening the dashboard. \
+If you're unsure whether something is allowed, assume it isn't. If a tool call fails or the context is \
+missing what's needed, say so briefly and suggest the user open or select the relevant meeting — don't \
+narrate or retry failed tool calls.
+";
+
+/// Build a prompt string combining conversation history (last 6 turns) and
+/// the current enriched user message.
+fn build_recall_chat_prompt(history: &[(String, String)], enriched_message: &str) -> String {
+    let mut prompt = String::new();
+
+    let recent: &[(String, String)] = if history.len() > 6 {
+        &history[history.len() - 6..]
+    } else {
+        history
+    };
+
+    if !recent.is_empty() {
+        prompt.push_str("[Previous conversation]\n");
+        for (user_msg, assistant_msg) in recent {
+            prompt.push_str("User: ");
+            prompt.push_str(user_msg);
+            prompt.push('\n');
+            prompt.push_str("Assistant: ");
+            prompt.push_str(assistant_msg);
+            prompt.push('\n');
+        }
+        prompt.push_str("\n[Current question]\n");
+    }
+
+    prompt.push_str(enriched_message);
+    prompt
+}
+
+/// Send a message from the native Recall chat panel and stream the response.
+///
+/// Provider priority:
+///   1. `config.summarization.engine == "ollama"` — HTTP to Ollama (localhost:11434)
+///   2. `detect_agent_cli()` found something — use that CLI:
+///      - `claude`: stream-json via `build_chat_invocation` — scoped to a
+///        read-only `--allowedTools` allow-list on the Minutes MCP server
+///        only (no shell, no writes, prompt on stdin), streamed token-by-token
+///      - others (codex/gemini/opencode): captured as plain-text stdout
+///   3. Nothing found — descriptive error returned to frontend, pointing the
+///      user at installing Claude Code. Minutes intentionally has no direct
+///      cloud-API fallback for chat: no-API-key-required is core to the
+///      product, so an installed agent CLI (or Ollama) is the only path.
+///
+/// Before invoking the AI, context is injected in two layers (capped at
+/// 12 000 chars total): (1) the full content of the meeting currently
+/// focused in the panel, if any — read via the same `current_meeting_path`
+/// state the palette uses — so referential questions like "what did we
+/// discuss in this meeting?" work even with no content-bearing keywords,
+/// and (2) up to 5 keyword-matched snippets from other meetings. Conversation
+/// history (last 6 turns) is prepended to the prompt.
+///
+/// Frontend events emitted: `recall-chat-chunk`, `recall-chat-done`,
+/// `recall-chat-error`. The existing PTY/xterm.js path is unchanged.
+#[tauri::command]
+pub async fn cmd_recall_chat_send(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    message: String,
+) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let workspace = crate::context::workspace_dir();
+    if !workspace.exists() {
+        std::fs::create_dir_all(&workspace)
+            .map_err(|e| format!("Cannot create workspace dir: {}", e))?;
+    }
+
+    // The native chat panel's context mostly comes from the keyword-search
+    // injection below, plus (for claude) a small read-only MCP tool allow-list —
+    // see build_chat_invocation. Run the CLI from a dedicated neutral directory —
+    // NOT the shared ~/.minutes/assistant workspace — so it does not auto-load
+    // that workspace's CLAUDE.md / AGENTS.md. Those files are written for the
+    // full-tool PTY assistant and instruct the model to read CURRENT_MEETING.md
+    // and run `minutes` commands via a shell it doesn't have here, so it would
+    // narrate a cascade of failed tool calls straight into the chat. Instead this
+    // cwd gets its own CHAT_WORKSPACE_CLAUDE_MD, honest about the single-shot,
+    // read-only-tools-only context. Claude/agents auto-load memory files from cwd
+    // regardless of `--strict-mcp-config` / `--allowedTools`, so isolating cwd
+    // (and writing our own CLAUDE.md into it) is the fix.
+    let chat_cwd = workspace
+        .parent()
+        .map(|p| p.join("chat"))
+        .unwrap_or_else(|| workspace.clone());
+    let _ = std::fs::create_dir_all(&chat_cwd);
+    // Rewritten on every message (cheap, static content) so a binary upgrade
+    // picks up new wording without requiring the user to clear the chat cwd.
+    let _ = std::fs::write(chat_cwd.join("CLAUDE.md"), CHAT_WORKSPACE_CLAUDE_MD);
+
+    // ── Step 1: inject meeting context ────────────────────────────────────────
+    let config = minutes_core::config::Config::load();
+    let meeting_context = {
+        let mut sections: Vec<String> = Vec::new();
+
+        // Prioritize the meeting the panel currently has focused. Keyword
+        // search on the raw question ("what did we discuss in this
+        // meeting?") often has no content-bearing terms and returns
+        // nothing, even though the user is clearly pointing at a specific,
+        // already-open meeting — see the Recall panel header context label.
+        if let Some(focused_path) = recall_workspace_current_meeting() {
+            if let Ok(content) = std::fs::read_to_string(&focused_path) {
+                let (frontmatter_str, body) = minutes_core::markdown::split_frontmatter(&content);
+                let title = serde_yaml::from_str::<minutes_core::markdown::Frontmatter>(
+                    frontmatter_str.trim(),
+                )
+                .ok()
+                .map(|fm| fm.title)
+                .unwrap_or_else(|| {
+                    focused_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+                let body = body.trim();
+                // Floor to a UTF-8 char boundary: a bare `&body[..6000]` panics
+                // when a multi-byte char (accents, CJK, emoji) straddles 6000.
+                let truncated_body = if body.len() > 6000 {
+                    let mut end = 6000;
+                    while end > 0 && !body.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &body[..end]
+                } else {
+                    body
+                };
+                sections.push(format!(
+                    "## Currently focused meeting: {}\n{}",
+                    title, truncated_body
+                ));
+            }
+        }
+
+        let filters = minutes_core::search::SearchFilters::default();
+        if let Ok(results) = minutes_core::search::search(&message, &config, &filters) {
+            let snippets: Vec<String> = results
+                .iter()
+                .take(5)
+                .map(|r| format!("## {} ({})\n{}", r.title, r.date, r.snippet))
+                .collect();
+            if !snippets.is_empty() {
+                sections.push(format!(
+                    "## Other relevant excerpts from your meetings\n\n{}",
+                    snippets.join("\n\n")
+                ));
+            }
+        }
+
+        if sections.is_empty() {
+            String::new()
+        } else {
+            let raw = format!("Meeting context:\n\n{}\n\n---\n\n", sections.join("\n\n"));
+            // Floor to a UTF-8 char boundary: `raw[..12000]` panics if a
+            // multi-byte char straddles 12000 (non-ASCII meeting content).
+            if raw.len() > 12000 {
+                let mut end = 12000;
+                while end > 0 && !raw.is_char_boundary(end) {
+                    end -= 1;
+                }
+                raw[..end].to_string()
+            } else {
+                raw
+            }
+        }
+    };
+    // The honest, single-shot / read-only-tools framing now lives in
+    // CHAT_WORKSPACE_CLAUDE_MD, written to chat_cwd/CLAUDE.md above — claude
+    // auto-loads CLAUDE.md from cwd at process start, so it doesn't need to be
+    // repeated inline on every message the way the old CHAT_NO_TOOLS_PREAMBLE
+    // was. Non-claude agent CLIs invoked via build_chat_invocation don't read
+    // that file's tool-scoping the same way, but the "single-shot, ground
+    // answers in the excerpts below" guidance still applies to them, so it's
+    // still useful context — just no longer claiming zero tool access, since
+    // claude's chat session does have a pre-approved read-only allow-list.
+    let enriched_message = format!("{}User question: {}", meeting_context, message);
+
+    // ── Step 2: build prompt with history ─────────────────────────────────────
+    let history_snapshot: Vec<(String, String)> = {
+        let h = state.recall_chat_history.lock().unwrap();
+        h.clone()
+    };
+    let full_prompt = build_recall_chat_prompt(&history_snapshot, &enriched_message);
+
+    // ── Step 3: detect provider ────────────────────────────────────────────────
+    let use_ollama = config.summarization.engine == "ollama";
+
+    // ── Ollama path ────────────────────────────────────────────────────────────
+    if use_ollama {
+        let ollama_url = config.summarization.ollama_url.clone();
+        let ollama_model = config.summarization.ollama_model.clone();
+        let app_clone = app.clone();
+        let message_clone = message.clone();
+        let history_arc = state.recall_chat_history.clone();
+
+        tauri::async_runtime::spawn_blocking(move || {
+            let url = format!("{}/api/chat", ollama_url);
+
+            let mut messages: Vec<serde_json::Value> = Vec::new();
+            for (u, a) in &history_snapshot {
+                messages.push(serde_json::json!({"role": "user", "content": u}));
+                messages.push(serde_json::json!({"role": "assistant", "content": a}));
+            }
+            messages.push(serde_json::json!({"role": "user", "content": enriched_message}));
+
+            let body = serde_json::json!({
+                "model": ollama_model,
+                "messages": messages,
+                "stream": true,
+            });
+
+            let agent = ureq::Agent::new_with_config(
+                ureq::config::Config::builder()
+                    .timeout_global(Some(std::time::Duration::from_secs(120)))
+                    .http_status_as_error(false)
+                    .build(),
+            );
+
+            let mut resp = match agent
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .send_json(&body)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    app_clone
+                        .emit_to("main", "recall-chat-error", format!("Ollama error: {}", e))
+                        .ok();
+                    app_clone.emit_to("main", "recall-chat-done", ()).ok();
+                    return;
+                }
+            };
+
+            if resp.status().as_u16() >= 400 {
+                let status = resp.status().as_u16();
+                let body_text = resp.body_mut().read_to_string().unwrap_or_default();
+                app_clone
+                    .emit_to(
+                        "main",
+                        "recall-chat-error",
+                        format!("Ollama HTTP {}: {}", status, body_text),
+                    )
+                    .ok();
+                app_clone.emit_to("main", "recall-chat-done", ()).ok();
+                return;
+            }
+
+            let mut body = resp.into_body();
+            let reader = BufReader::new(body.as_reader());
+            let mut full_response = String::new();
+            for line_result in reader.lines() {
+                match line_result {
+                    Ok(line) if !line.trim().is_empty() => {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                            if let Some(text) = val
+                                .get("message")
+                                .and_then(|m| m.get("content"))
+                                .and_then(|c| c.as_str())
+                            {
+                                full_response.push_str(text);
+                                app_clone
+                                    .emit_to(
+                                        "main",
+                                        "recall-chat-chunk",
+                                        serde_json::json!({"type": "text", "text": text}),
+                                    )
+                                    .ok();
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("[recall-chat/ollama] read error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            if !full_response.is_empty() {
+                let mut h = history_arc.lock().unwrap();
+                h.push((message_clone, full_response));
+            }
+            app_clone.emit_to("main", "recall-chat-done", ()).ok();
+        })
+        .await
+        .map_err(|e| format!("Recall chat Ollama task failed: {}", e))?;
+
+        return Ok(());
+    }
+
+    // ── CLI agent path ─────────────────────────────────────────────────────────
+    let agent_bin = minutes_core::summarize::detect_agent_cli().ok_or_else(|| {
+        "No AI agent found for Recall chat. Install Claude Code (npm install -g \
+         @anthropic-ai/claude-code), Codex, or Gemini CLI to enable chat — or configure \
+         Ollama ([summarization] engine = \"ollama\" in config.toml) for a fully local \
+         option. Minutes doesn't require an API key for this feature."
+            .to_string()
+    })?;
+
+    let is_claude_cli = std::path::Path::new(&agent_bin)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("claude"))
+        .unwrap_or(false);
+
+    let history_arc = state.recall_chat_history.clone();
+    let message_clone = message.clone();
+
+    if is_claude_cli {
+        // Claude CLI: incremental stream-json output, prompt via stdin.
+        // Built by build_chat_invocation's claude-specific path (separate from
+        // the #382 zero-MCP/zero-tools lean branch used by speaker mapping):
+        // `--strict-mcp-config` + an inline `--mcp-config` register only the
+        // Minutes MCP server, and `--allowedTools` pre-approves a read-only
+        // subset of its tools, upgraded to `--output-format stream-json
+        // --verbose` for token-by-token rendering. Passing the prompt on stdin
+        // (not as a `-p <arg>`) also avoids the Windows command-line length
+        // limit on long transcripts. This replaced a hand-rolled arg list that
+        // carried a non-existent `--no-interactive` flag and errored on every
+        // message.
+        let invocation =
+            minutes_core::summarize::build_chat_invocation(&agent_bin, &full_prompt, true)
+                .map_err(|e| format!("Failed to prepare claude invocation: {}", e))?;
+        let args = invocation.args.clone();
+
+        #[cfg(target_os = "windows")]
+        let mut child = {
+            let ext = std::path::Path::new(&agent_bin)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext == "cmd" || ext == "bat" {
+                Command::new("cmd")
+                    .arg("/C")
+                    .arg(&agent_bin)
+                    .args(&args)
+                    .current_dir(&chat_cwd)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("Failed to spawn claude: {}", e))?
+            } else {
+                Command::new(&agent_bin)
+                    .args(&args)
+                    .current_dir(&chat_cwd)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("Failed to spawn claude: {}", e))?
+            }
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let mut child = Command::new(&agent_bin)
+            .args(&args)
+            .current_dir(&chat_cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn claude: {}", e))?;
+
+        if let Some(payload) = invocation.stdin_payload {
+            if let Some(mut stdin_handle) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin_handle.write_all(&payload);
+            }
+        }
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "No stdout handle from claude".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "No stderr handle from claude".to_string())?;
+
+        let app_stderr = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let stderr_thread = std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                let mut buf = String::new();
+                for line in reader.lines().flatten() {
+                    if !line.trim().is_empty() {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
+                if !buf.is_empty() {
+                    app_stderr
+                        .emit_to("main", "recall-chat-error", buf.trim().to_string())
+                        .ok();
+                }
+            });
+
+            let reader = BufReader::new(stdout);
+            let mut full_response = String::new();
+            for line_result in reader.lines() {
+                match line_result {
+                    Ok(line) if !line.trim().is_empty() => {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                            if json.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                                if let Some(arr) = json
+                                    .get("message")
+                                    .and_then(|m| m.get("content"))
+                                    .and_then(|c| c.as_array())
+                                {
+                                    for block in arr {
+                                        if let Some(text) =
+                                            block.get("text").and_then(|t| t.as_str())
+                                        {
+                                            full_response.push_str(text);
+                                        }
+                                    }
+                                }
+                            }
+                            app.emit_to("main", "recall-chat-chunk", json).ok();
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("[recall-chat] stdout read error: {}", e);
+                        break;
+                    }
+                }
+            }
+            let _ = stderr_thread.join();
+
+            if !full_response.is_empty() {
+                let mut h = history_arc.lock().unwrap();
+                h.push((message_clone, full_response));
+            }
+
+            app.emit_to("main", "recall-chat-done", ()).ok();
+            let _ = child.wait();
+        })
+        .await
+        .map_err(|e| format!("Recall chat streaming task failed: {}", e))?;
+    } else {
+        // Other CLIs (codex / gemini / opencode): capture plain-text stdout.
+        let invocation =
+            minutes_core::summarize::build_chat_invocation(&agent_bin, &full_prompt, false)
+                .map_err(|e| format!("Failed to prepare agent invocation: {}", e))?;
+
+        let stdin_stdio = if invocation.stdin_payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        };
+
+        #[cfg(target_os = "windows")]
+        let mut child = {
+            let ext = std::path::Path::new(&invocation.cmd)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext == "cmd" || ext == "bat" {
+                Command::new("cmd")
+                    .arg("/C")
+                    .arg(&invocation.cmd)
+                    .args(&invocation.args)
+                    .current_dir(&chat_cwd)
+                    .stdin(stdin_stdio)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("Failed to spawn {}: {}", invocation.cmd, e))?
+            } else {
+                Command::new(&invocation.cmd)
+                    .args(&invocation.args)
+                    .current_dir(&chat_cwd)
+                    .stdin(stdin_stdio)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("Failed to spawn {}: {}", invocation.cmd, e))?
+            }
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let mut child = Command::new(&invocation.cmd)
+            .args(&invocation.args)
+            .current_dir(&chat_cwd)
+            .stdin(stdin_stdio)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn {}: {}", invocation.cmd, e))?;
+
+        if let Some(payload) = invocation.stdin_payload {
+            if let Some(mut stdin_handle) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin_handle.write_all(&payload);
+            }
+        }
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("No stdout from {}", invocation.cmd))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| format!("No stderr from {}", invocation.cmd))?;
+
+        let cleanup_path = invocation.cleanup_path;
+        let app_clone = app.clone();
+
+        tauri::async_runtime::spawn_blocking(move || {
+            let app_stderr2 = app_clone.clone();
+            let stderr_thread = std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                let mut buf = String::new();
+                for line in reader.lines().flatten() {
+                    if !line.trim().is_empty() {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
+                if !buf.is_empty() {
+                    app_stderr2
+                        .emit_to("main", "recall-chat-error", buf.trim().to_string())
+                        .ok();
+                }
+            });
+
+            use std::io::Read;
+            let mut full_response = String::new();
+            let mut reader = BufReader::new(stdout);
+            let _ = reader.read_to_string(&mut full_response);
+
+            let _ = stderr_thread.join();
+
+            if let Some(path) = cleanup_path {
+                let _ = std::fs::remove_file(path);
+            }
+
+            let trimmed = full_response.trim().to_string();
+            if !trimmed.is_empty() {
+                app_clone
+                    .emit_to(
+                        "main",
+                        "recall-chat-chunk",
+                        serde_json::json!({"type": "text", "text": &trimmed}),
+                    )
+                    .ok();
+                let mut h = history_arc.lock().unwrap();
+                h.push((message_clone, trimmed));
+            }
+
+            app_clone.emit_to("main", "recall-chat-done", ()).ok();
+            let _ = child.wait();
+        })
+        .await
+        .map_err(|e| format!("Recall chat agent task failed: {}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Clear the Recall chat conversation history so the next message starts
+/// a fresh context. The frontend should call this when the user resets the panel.
+#[tauri::command]
+pub fn cmd_recall_chat_clear(state: tauri::State<'_, AppState>) {
+    let mut h = state.recall_chat_history.lock().unwrap();
+    h.clear();
+}
+
 #[tauri::command]
 pub fn cmd_spawn_terminal(
     app: tauri::AppHandle,
@@ -9338,6 +9960,7 @@ mod tests {
             call_end_countdown_cancel: Arc::new(AtomicBool::new(false)),
             call_end_countdown_active: Arc::new(AtomicBool::new(false)),
             call_end_countdown_terminal_state: Arc::new(AtomicU8::new(0)),
+            recall_chat_history: Arc::new(Mutex::new(Vec::new())),
         }
     }
 

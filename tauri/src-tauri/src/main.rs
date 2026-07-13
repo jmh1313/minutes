@@ -1722,6 +1722,7 @@ fn main() {
             call_end_countdown_cancel: call_end_countdown_cancel.clone(),
             call_end_countdown_active: call_end_countdown_active.clone(),
             call_end_countdown_terminal_state: call_end_countdown_terminal_state.clone(),
+            recall_chat_history: Arc::new(Mutex::new(Vec::new())),
         })
         .manage(Arc::new(Mutex::new(
             shortcut_manager::ShortcutManager::new(),
@@ -2576,6 +2577,8 @@ fn main() {
             cmd_apply_recall_window_layout,
             cmd_scale_window,
             commands::cmd_upcoming_meetings,
+            commands::cmd_recall_chat_send,
+            commands::cmd_recall_chat_clear,
             commands::cmd_spawn_terminal,
             commands::cmd_pty_input,
             commands::cmd_pty_resize,
